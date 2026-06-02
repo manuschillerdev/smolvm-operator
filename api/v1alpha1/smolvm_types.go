@@ -23,11 +23,15 @@ import (
 const (
 	SmolVMFinalizer = "smolvms.vm.smolvm.dev/finalizer"
 
-	ConditionReady      = "Ready"
-	ConditionReconciled = "Reconciled"
+	ConditionReady        = "Ready"
+	ConditionRuntimeReady = "RuntimeReady"
+	ConditionGuestReady   = "GuestReady"
+	ConditionReconciled   = "Reconciled"
 )
 
 // SmolVMSpec defines the desired state of a smolvm machine.
+// +kubebuilder:validation:XValidation:rule="(has(self.image) && size(self.image) > 0) != (has(self.from) && size(self.from) > 0)",message="exactly one of spec.image or spec.from is required"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.nodeName) || (has(self.nodeName) && self.nodeName == oldSelf.nodeName)",message="spec.nodeName is immutable after binding"
 type SmolVMSpec struct {
 	// Running declares whether the machine should be running.
 	//+kubebuilder:default=true
@@ -39,11 +43,13 @@ type SmolVMSpec struct {
 	NodeName string `json:"nodeName,omitempty"`
 
 	// Image is an OCI image to run inside the smolvm machine.
+	//+kubebuilder:validation:MinLength=1
 	//+optional
 	Image string `json:"image,omitempty"`
 
 	// From is a path to a .smolmachine sidecar artifact available to the node runtime.
 	// It is mutually exclusive with Image.
+	//+kubebuilder:validation:MinLength=1
 	//+optional
 	From string `json:"from,omitempty"`
 
@@ -93,10 +99,13 @@ type SmolVMNetwork struct {
 	Enabled bool `json:"enabled,omitempty"`
 
 	// AllowedCIDRs restricts egress to the listed CIDR ranges when supported by the runtime.
+	//+kubebuilder:validation:items:Format=cidr
 	//+optional
 	AllowedCIDRs []string `json:"allowedCIDRs,omitempty"`
 
 	// Ports maps host ports to guest ports on the selected node.
+	//+listType=map
+	//+listMapKey=hostPort
 	//+optional
 	Ports []SmolVMPort `json:"ports,omitempty"`
 }
@@ -127,6 +136,26 @@ type SmolVMStatus struct {
 	// MachineName is the stable smolvm runtime name owned by this CR.
 	//+optional
 	MachineName string `json:"machineName,omitempty"`
+
+	// RuntimePID is the local process ID reported by the smolvm runtime when available.
+	//+optional
+	RuntimePID *int32 `json:"runtimePID,omitempty"`
+
+	// Network is the runtime-observed network enablement.
+	//+optional
+	Network bool `json:"network,omitempty"`
+
+	// Ports are the runtime-observed host-to-guest port mappings.
+	//+optional
+	Ports []SmolVMPort `json:"ports,omitempty"`
+
+	// StorageGiB is the runtime-observed storage disk size.
+	//+optional
+	StorageGiB *int64 `json:"storageGiB,omitempty"`
+
+	// OverlayGiB is the runtime-observed overlay disk size.
+	//+optional
+	OverlayGiB *int64 `json:"overlayGiB,omitempty"`
 
 	// ObservedGeneration is the metadata generation last reconciled by the controller.
 	//+optional

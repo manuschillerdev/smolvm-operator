@@ -72,6 +72,8 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        - name: SMOLVM_API_SOCKET
+          value: /var/run/smolvm/smolvm.sock
         image: controller:latest
         name: manager
         securityContext:
@@ -100,5 +102,14 @@ spec:
           requests:
             cpu: 10m
             memory: 64Mi
+        volumeMounts:
+        - name: smolvm-run
+          mountPath: /var/run/smolvm
+          readOnly: false
+      volumes:
+      - name: smolvm-run
+        hostPath:
+          path: /var/run/smolvm
+          type: Directory
       serviceAccountName: controller-manager
       terminationGracePeriodSeconds: 10

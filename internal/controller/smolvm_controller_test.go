@@ -15,6 +15,39 @@ import (
 	smolvmapi "github.com/manuschillerdev/smolvm-operator/internal/smolvm"
 )
 
+func TestValidateSpecRejectsInvalidNetworkInputs(t *testing.T) {
+	vm := &vmv1alpha1.SmolVM{
+		Spec: vmv1alpha1.SmolVMSpec{
+			Image: "alpine:latest",
+			Network: vmv1alpha1.SmolVMNetwork{
+				AllowedCIDRs: []string{"not-a-cidr"},
+			},
+		},
+	}
+	if err := validateSpec(vm); err == nil {
+		t.Fatal("expected invalid CIDR to be rejected")
+	}
+
+	vm.Spec.Network.AllowedCIDRs = nil
+	vm.Spec.Network.Ports = []vmv1alpha1.SmolVMPort{
+		{HostPort: 8080, GuestPort: 80},
+		{HostPort: 8080, GuestPort: 8080},
+	}
+	if err := validateSpec(vm); err == nil {
+		t.Fatal("expected duplicate hostPort to be rejected")
+	}
+}
+
+func TestValidateSpecRejectsNodeMoveAfterBinding(t *testing.T) {
+	vm := &vmv1alpha1.SmolVM{
+		Spec:   vmv1alpha1.SmolVMSpec{NodeName: "node-b", Image: "alpine:latest"},
+		Status: vmv1alpha1.SmolVMStatus{NodeName: "node-a"},
+	}
+	if err := validateSpec(vm); err == nil {
+		t.Fatal("expected nodeName mutation to be rejected")
+	}
+}
+
 func TestBuildCreateRequestMapsSpec(t *testing.T) {
 	vm := &vmv1alpha1.SmolVM{
 		ObjectMeta: metav1.ObjectMeta{Name: "alpine", Namespace: "default"},

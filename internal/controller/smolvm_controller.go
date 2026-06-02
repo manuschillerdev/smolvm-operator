@@ -21,12 +21,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"os"
+	"sort"
 	"time"
 
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -44,6 +48,7 @@ type SmolVMReconciler struct {
 	Scheme *runtime.Scheme
 
 	RuntimeFactory func() SmolVMRuntime
+	Recorder       record.EventRecorder
 }
 
 type SmolVMRuntime interface {
@@ -65,6 +70,7 @@ func (r *SmolVMReconciler) runtimeClient() SmolVMRuntime {
 //+kubebuilder:rbac:groups=vm.smolvm.dev,resources=smolvms,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=vm.smolvm.dev,resources=smolvms/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=vm.smolvm.dev,resources=smolvms/finalizers,verbs=update
+//+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -76,8 +82,9 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	runtimeNode := os.Getenv("SMOLVM_NODE_NAME")
 	desiredNode := vm.Spec.NodeName
-	if desiredNode == "" {
-		desiredNode = vm.Status.NodeName
+	ownerNode := vm.Status.NodeName
+	if ownerNode == "" {
+		ownerNode = desiredNode
 	}
 
 	machineName := vm.Status.MachineName
@@ -85,7 +92,7 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		machineName = stableMachineName(&vm)
 	}
 
-	if runtimeNode != "" && desiredNode == "" {
+	if runtimeNode != "" && ownerNode == "" {
 		return r.updateStatus(ctx, &vm, statusInput{
 			Phase:       "Pending",
 			NodeName:    "",
@@ -99,14 +106,14 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		})
 	}
 
-	if desiredNode != "" && runtimeNode != "" && desiredNode != runtimeNode {
+	if ownerNode != "" && runtimeNode != "" && ownerNode != runtimeNode {
 		return ctrl.Result{}, nil
 	}
 
 	api := r.runtimeClient()
 
 	if !vm.ObjectMeta.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, &vm, api, machineName)
+		return r.reconcileDelete(ctx, &vm, api, machineName, ownerNode)
 	}
 
 	if !controllerutil.ContainsFinalizer(&vm, vmv1alpha1.SmolVMFinalizer) {
@@ -116,9 +123,10 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	if err := validateSpec(&vm); err != nil {
 		logger.Info("invalid SmolVM spec", "error", err.Error())
+		r.event(&vm, "Warning", "InvalidSpec", err.Error())
 		return r.updateStatus(ctx, &vm, statusInput{
 			Phase:       "Failed",
-			NodeName:    desiredNode,
+			NodeName:    ownerNode,
 			MachineName: machineName,
 			Ready:       metav1.ConditionFalse,
 			ReadyReason: "InvalidSpec",
@@ -133,14 +141,16 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if smolvmapi.IsNotFound(err) {
 		createReq := buildCreateRequest(&vm, machineName)
 		logger.Info("creating smolvm machine", "machine", machineName)
+		r.event(&vm, "Normal", "Creating", fmt.Sprintf("creating smolvm machine %s", machineName))
 		machine, err = api.CreateMachine(ctx, createReq)
 		if err != nil {
-			return r.runtimeUnavailable(ctx, &vm, desiredNode, machineName, err)
+			return r.runtimeUnavailable(ctx, &vm, ownerNode, machineName, err)
 		}
 		_, statusErr := r.updateStatus(ctx, &vm, statusInput{
 			Phase:       phaseFromMachine(machine),
-			NodeName:    desiredNode,
+			NodeName:    ownerNode,
 			MachineName: machineName,
+			Machine:     machine,
 			Ready:       metav1.ConditionFalse,
 			ReadyReason: "Created",
 			ReadyMsg:    "smolvm machine has been created; waiting before start",
@@ -154,14 +164,31 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
 	if err != nil {
-		return r.runtimeUnavailable(ctx, &vm, desiredNode, machineName, err)
+		return r.runtimeUnavailable(ctx, &vm, ownerNode, machineName, err)
+	}
+
+	if immutableErr := validateImmutableRuntimeFields(&vm, machine); immutableErr != nil {
+		r.event(&vm, "Warning", "UnsupportedUpdate", immutableErr.Error())
+		return r.updateStatus(ctx, &vm, statusInput{
+			Phase:       phaseFromMachine(machine),
+			NodeName:    ownerNode,
+			MachineName: machineName,
+			Machine:     machine,
+			Ready:       readyFromMachine(machine),
+			ReadyReason: "Observed",
+			ReadyMsg:    fmt.Sprintf("smolvm machine is %s", machine.State),
+			Recon:       metav1.ConditionFalse,
+			ReconReason: "UnsupportedUpdate",
+			ReconMsg:    immutableErr.Error(),
+		})
 	}
 
 	if invalidResize := validateStorageDoesNotShrink(&vm, machine); invalidResize != nil {
 		return r.updateStatus(ctx, &vm, statusInput{
 			Phase:       phaseFromMachine(machine),
-			NodeName:    desiredNode,
+			NodeName:    ownerNode,
 			MachineName: machineName,
+			Machine:     machine,
 			Ready:       readyFromMachine(machine),
 			ReadyReason: "Observed",
 			ReadyMsg:    fmt.Sprintf("smolvm machine is %s", machine.State),
@@ -175,8 +202,9 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if machine.State == "running" {
 			return r.updateStatus(ctx, &vm, statusInput{
 				Phase:       phaseFromMachine(machine),
-				NodeName:    desiredNode,
+				NodeName:    ownerNode,
 				MachineName: machineName,
+				Machine:     machine,
 				Ready:       readyFromMachine(machine),
 				ReadyReason: "ResizePending",
 				ReadyMsg:    "storage expansion requires the machine to be stopped",
@@ -187,31 +215,35 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 		resize := buildResizeRequest(&vm)
 		logger.Info("resizing smolvm machine", "machine", machineName)
+		r.event(&vm, "Normal", "Resizing", fmt.Sprintf("resizing smolvm machine %s", machineName))
 		if err := api.ResizeMachine(ctx, machineName, resize); err != nil {
-			return r.runtimeUnavailable(ctx, &vm, desiredNode, machineName, err)
+			return r.runtimeUnavailable(ctx, &vm, ownerNode, machineName, err)
 		}
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
 
 	if vm.Spec.Running && machine.State != "running" {
 		logger.Info("starting smolvm machine", "machine", machineName, "state", machine.State)
+		r.event(&vm, "Normal", "Starting", fmt.Sprintf("starting smolvm machine %s", machineName))
 		if err := api.EnsureMachineRunning(ctx, machineName); err != nil {
-			return r.runtimeUnavailable(ctx, &vm, desiredNode, machineName, err)
+			return r.runtimeUnavailable(ctx, &vm, ownerNode, machineName, err)
 		}
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
 	if !vm.Spec.Running && machine.State == "running" {
 		logger.Info("stopping smolvm machine", "machine", machineName)
+		r.event(&vm, "Normal", "Stopping", fmt.Sprintf("stopping smolvm machine %s", machineName))
 		if err := api.StopMachine(ctx, machineName); err != nil {
-			return r.runtimeUnavailable(ctx, &vm, desiredNode, machineName, err)
+			return r.runtimeUnavailable(ctx, &vm, ownerNode, machineName, err)
 		}
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
 
 	result, err := r.updateStatus(ctx, &vm, statusInput{
 		Phase:       phaseFromMachine(machine),
-		NodeName:    desiredNode,
+		NodeName:    ownerNode,
 		MachineName: machineName,
+		Machine:     machine,
 		Ready:       readyFromMachine(machine),
 		ReadyReason: "Observed",
 		ReadyMsg:    fmt.Sprintf("smolvm machine is %s", machine.State),
@@ -225,10 +257,11 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
-func (r *SmolVMReconciler) reconcileDelete(ctx context.Context, vm *vmv1alpha1.SmolVM, api SmolVMRuntime, machineName string) (ctrl.Result, error) {
+func (r *SmolVMReconciler) reconcileDelete(ctx context.Context, vm *vmv1alpha1.SmolVM, api SmolVMRuntime, machineName, ownerNode string) (ctrl.Result, error) {
 	if machineName != "" {
+		r.event(vm, "Normal", "Deleting", fmt.Sprintf("deleting smolvm machine %s", machineName))
 		if err := api.DeleteMachine(ctx, machineName); err != nil && !smolvmapi.IsNotFound(err) {
-			return r.runtimeUnavailable(ctx, vm, vm.Status.NodeName, machineName, err)
+			return r.runtimeUnavailable(ctx, vm, ownerNode, machineName, err)
 		}
 	}
 	controllerutil.RemoveFinalizer(vm, vmv1alpha1.SmolVMFinalizer)
@@ -236,6 +269,7 @@ func (r *SmolVMReconciler) reconcileDelete(ctx context.Context, vm *vmv1alpha1.S
 }
 
 func (r *SmolVMReconciler) runtimeUnavailable(ctx context.Context, vm *vmv1alpha1.SmolVM, nodeName, machineName string, err error) (ctrl.Result, error) {
+	r.event(vm, "Warning", "RuntimeUnavailable", err.Error())
 	_, statusErr := r.updateStatus(ctx, vm, statusInput{
 		Phase:       "Unknown",
 		NodeName:    nodeName,
@@ -257,6 +291,7 @@ type statusInput struct {
 	Phase       string
 	NodeName    string
 	MachineName string
+	Machine     *smolvmapi.MachineInfo
 	Ready       metav1.ConditionStatus
 	ReadyReason string
 	ReadyMsg    string
@@ -270,12 +305,25 @@ func (r *SmolVMReconciler) updateStatus(ctx context.Context, vm *vmv1alpha1.Smol
 	if err := r.Get(ctx, types.NamespacedName{Name: vm.Name, Namespace: vm.Namespace}, latest); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	previous := latest.Status.DeepCopy()
 	latest.Status.Phase = in.Phase
 	latest.Status.NodeName = in.NodeName
 	latest.Status.MachineName = in.MachineName
+	if in.Machine != nil {
+		latest.Status.RuntimePID = in.Machine.PID
+		latest.Status.Network = in.Machine.Network
+		latest.Status.Ports = portsFromRuntime(in.Machine.Ports)
+		latest.Status.StorageGiB = in.Machine.StorageGB
+		latest.Status.OverlayGiB = in.Machine.OverlayGB
+	}
 	latest.Status.ObservedGeneration = latest.Generation
 	setCondition(&latest.Status.Conditions, vmv1alpha1.ConditionReady, in.Ready, in.ReadyReason, in.ReadyMsg, latest.Generation)
+	setCondition(&latest.Status.Conditions, vmv1alpha1.ConditionRuntimeReady, in.Ready, in.ReadyReason, in.ReadyMsg, latest.Generation)
+	setCondition(&latest.Status.Conditions, vmv1alpha1.ConditionGuestReady, metav1.ConditionUnknown, "GuestReadinessUnavailable", "smolvm guest readiness is not reported by the runtime API", latest.Generation)
 	setCondition(&latest.Status.Conditions, vmv1alpha1.ConditionReconciled, in.Recon, in.ReconReason, in.ReconMsg, latest.Generation)
+	if apiequality.Semantic.DeepEqual(previous, &latest.Status) {
+		return ctrl.Result{}, nil
+	}
 	return ctrl.Result{}, r.Status().Update(ctx, latest)
 }
 
@@ -303,11 +351,26 @@ func setCondition(conditions *[]metav1.Condition, typ string, status metav1.Cond
 }
 
 func validateSpec(vm *vmv1alpha1.SmolVM) error {
+	if vm.Status.NodeName != "" && vm.Spec.NodeName != "" && vm.Spec.NodeName != vm.Status.NodeName {
+		return fmt.Errorf("spec.nodeName is immutable after binding; machine is owned by node %q", vm.Status.NodeName)
+	}
 	if vm.Spec.Image != "" && vm.Spec.From != "" {
 		return fmt.Errorf("spec.image and spec.from are mutually exclusive")
 	}
 	if vm.Spec.Image == "" && vm.Spec.From == "" {
 		return fmt.Errorf("one of spec.image or spec.from is required")
+	}
+	seenPorts := map[int32]struct{}{}
+	for _, port := range vm.Spec.Network.Ports {
+		if _, ok := seenPorts[port.HostPort]; ok {
+			return fmt.Errorf("duplicate hostPort %d", port.HostPort)
+		}
+		seenPorts[port.HostPort] = struct{}{}
+	}
+	for _, cidr := range vm.Spec.Network.AllowedCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("invalid allowedCIDR %q: %w", cidr, err)
+		}
 	}
 	return nil
 }
@@ -343,6 +406,52 @@ func buildResizeRequest(vm *vmv1alpha1.SmolVM) smolvmapi.ResizeRequest {
 		req.OverlayGB = &vm.Spec.Storage.OverlayGiB
 	}
 	return req
+}
+
+func validateImmutableRuntimeFields(vm *vmv1alpha1.SmolVM, machine *smolvmapi.MachineInfo) error {
+	if vm.Spec.Resources.CPUs > 0 && machine.CPUs > 0 && vm.Spec.Resources.CPUs != machine.CPUs {
+		return fmt.Errorf("cpus is immutable after creation; runtime has %d and spec requests %d", machine.CPUs, vm.Spec.Resources.CPUs)
+	}
+	if vm.Spec.Resources.MemoryMiB > 0 && machine.MemoryMiB > 0 && vm.Spec.Resources.MemoryMiB != machine.MemoryMiB {
+		return fmt.Errorf("memoryMiB is immutable after creation; runtime has %d and spec requests %d", machine.MemoryMiB, vm.Spec.Resources.MemoryMiB)
+	}
+	if !samePorts(vm.Spec.Network.Ports, machine.Ports) {
+		return fmt.Errorf("network port mappings are immutable after creation")
+	}
+	return nil
+}
+
+func samePorts(spec []vmv1alpha1.SmolVMPort, runtime []smolvmapi.PortSpec) bool {
+	if len(spec) != len(runtime) {
+		return false
+	}
+	specPorts := make([]string, 0, len(spec))
+	for _, p := range spec {
+		specPorts = append(specPorts, fmt.Sprintf("%d:%d", p.HostPort, p.GuestPort))
+	}
+	runtimePorts := make([]string, 0, len(runtime))
+	for _, p := range runtime {
+		runtimePorts = append(runtimePorts, fmt.Sprintf("%d:%d", p.Host, p.Guest))
+	}
+	sort.Strings(specPorts)
+	sort.Strings(runtimePorts)
+	for i := range specPorts {
+		if specPorts[i] != runtimePorts[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func portsFromRuntime(ports []smolvmapi.PortSpec) []vmv1alpha1.SmolVMPort {
+	if len(ports) == 0 {
+		return nil
+	}
+	out := make([]vmv1alpha1.SmolVMPort, 0, len(ports))
+	for _, port := range ports {
+		out = append(out, vmv1alpha1.SmolVMPort{HostPort: port.Host, GuestPort: port.Guest})
+	}
+	return out
 }
 
 func validateStorageDoesNotShrink(vm *vmv1alpha1.SmolVM, machine *smolvmapi.MachineInfo) error {
@@ -386,8 +495,17 @@ func stableMachineName(vm *vmv1alpha1.SmolVM) string {
 	return fmt.Sprintf("k8s-%s-%s-%s", vm.Namespace, vm.Name, uid)
 }
 
+func (r *SmolVMReconciler) event(vm *vmv1alpha1.SmolVM, eventType, reason, message string) {
+	if r.Recorder != nil {
+		r.Recorder.Event(vm, eventType, reason, message)
+	}
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *SmolVMReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorderFor("smolvm-controller")
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&vmv1alpha1.SmolVM{}).
 		Complete(r)
