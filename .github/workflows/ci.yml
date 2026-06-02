@@ -15,6 +15,8 @@ jobs:
         run: |
           uname -a
           ls -l /dev/kvm || true
+          sudo chmod 666 /dev/kvm
+          ls -l /dev/kvm
           python3 - <<'PY'
           import os
           try:
