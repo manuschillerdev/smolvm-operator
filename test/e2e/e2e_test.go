@@ -18,8 +18,10 @@ var _ = Describe("controller", Ordered, func() {
 	const projectImage = "example.com/smolvm-operator:e2e"
 
 	AfterAll(func() {
-		_, _ = utils.Run(exec.Command("make", "undeploy", "ignore-not-found=true"))
-		_, _ = utils.Run(exec.Command("make", "uninstall", "ignore-not-found=true"))
+		_, _ = utils.Run(exec.Command("kubectl", "patch", "smolvm", "smolvm-sample", "--type=merge", "-p", `{"metadata":{"finalizers":[]}}`))
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "smolvm", "smolvm-sample", "--ignore-not-found=true", "--wait=false"))
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "-k", "config/default", "--ignore-not-found=true", "--wait=false"))
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "-k", "config/crd", "--ignore-not-found=true", "--wait=false"))
 	})
 
 	It("deploys on kind and reports RuntimeUnavailable without smolvm", func() {

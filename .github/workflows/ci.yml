@@ -7,6 +7,25 @@ on:
   workflow_dispatch:
 
 jobs:
+  kvm-check:
+    name: kvm check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check runner KVM access
+        run: |
+          uname -a
+          ls -l /dev/kvm || true
+          python3 - <<'PY'
+          import os
+          try:
+              fd = os.open("/dev/kvm", os.O_RDWR)
+              print("KVM open: OK")
+              os.close(fd)
+          except Exception as e:
+              print("KVM open: FAIL:", e)
+              raise SystemExit(1)
+          PY
+
   unit:
     name: unit
     runs-on: ubuntu-latest
