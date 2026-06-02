@@ -1,0 +1,26 @@
+apiVersion: vm.smolvm.dev/v1alpha1
+kind: SmolVM
+metadata:
+  labels:
+    app.kubernetes.io/name: smolvm
+    app.kubernetes.io/instance: smolvm-sample
+    app.kubernetes.io/part-of: operator
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/created-by: operator
+  name: smolvm-sample
+spec:
+  # Required when the controller runs node-local with SMOLVM_NODE_NAME set.
+  nodeName: worker-1
+  running: true
+  image: alpine:latest
+  resources:
+    cpus: 1
+    memoryMiB: 512
+  storage:
+    storageGiB: 20
+    overlayGiB: 10
+  network:
+    enabled: true
+    ports:
+      - hostPort: 8080
+        guestPort: 80

@@ -1,0 +1,32 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - vm.smolvm.dev
+  resources:
+  - smolvms
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - vm.smolvm.dev
+  resources:
+  - smolvms/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - vm.smolvm.dev
+  resources:
+  - smolvms/status
+  verbs:
+  - get
+  - patch
+  - update
