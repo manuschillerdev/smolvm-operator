@@ -85,6 +85,8 @@ jobs:
           cluster_name: runtime
       - name: Install smolvm
         run: |
+          sudo apt-get update
+          sudo apt-get install -y libvirglrenderer1 libepoxy0 libgbm1
           curl -fsSL -o /tmp/smolvm.tar.gz https://github.com/smol-machines/smolvm/releases/download/v0.8.1/smolvm-0.8.1-linux-x86_64.tar.gz
           mkdir -p /tmp/smolvm
           tar -xzf /tmp/smolvm.tar.gz -C /tmp/smolvm --strip-components=1
@@ -94,6 +96,8 @@ jobs:
         run: |
           set -euxo pipefail
           sudo chmod 666 /dev/kvm
+          export LD_LIBRARY_PATH="/tmp/smolvm/lib:${LD_LIBRARY_PATH:-}"
+          export LD_PRELOAD="$(find /usr/lib -name 'libvirglrenderer.so.1' | head -1)"
           smolvm serve start --listen 127.0.0.1:8080 > smolvm-serve.log 2>&1 &
           serve_pid=$!
           trap 'kubectl delete smolvm runtime-smoke --ignore-not-found=true --wait=false || true; kill $serve_pid || true; cat smolvm-serve.log || true' EXIT
