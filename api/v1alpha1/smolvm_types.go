@@ -35,7 +35,7 @@ const (
 type SmolVMSpec struct {
 	// Running declares whether the machine should be running.
 	//+kubebuilder:default=true
-	Running bool `json:"running,omitempty"`
+	Running bool `json:"running"`
 
 	// NodeName pins the machine to a Kubernetes node. Machines are node-local and
 	// must not move implicitly after creation.

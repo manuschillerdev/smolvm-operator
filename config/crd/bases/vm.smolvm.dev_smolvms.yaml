@@ -142,6 +142,8 @@ spec:
                     minimum: 1
                     type: integer
                 type: object
+            required:
+            - running
             type: object
             x-kubernetes-validations:
             - message: exactly one of spec.image or spec.from is required
