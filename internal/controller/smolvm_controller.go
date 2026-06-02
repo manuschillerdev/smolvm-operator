@@ -42,6 +42,24 @@ const requeueAfter = 10 * time.Second
 type SmolVMReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	RuntimeFactory func() SmolVMRuntime
+}
+
+type SmolVMRuntime interface {
+	GetMachine(context.Context, string) (*smolvmapi.MachineInfo, error)
+	CreateMachine(context.Context, smolvmapi.CreateMachineRequest) (*smolvmapi.MachineInfo, error)
+	EnsureMachineRunning(context.Context, string) error
+	StopMachine(context.Context, string) error
+	DeleteMachine(context.Context, string) error
+	ResizeMachine(context.Context, string, smolvmapi.ResizeRequest) error
+}
+
+func (r *SmolVMReconciler) runtimeClient() SmolVMRuntime {
+	if r.RuntimeFactory != nil {
+		return r.RuntimeFactory()
+	}
+	return smolvmapi.NewClient(os.Getenv("SMOLVM_API_URL"), os.Getenv("SMOLVM_API_SOCKET"))
 }
 
 //+kubebuilder:rbac:groups=vm.smolvm.dev,resources=smolvms,verbs=get;list;watch;create;update;patch;delete
@@ -85,7 +103,7 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, nil
 	}
 
-	api := smolvmapi.NewClient(os.Getenv("SMOLVM_API_URL"), os.Getenv("SMOLVM_API_SOCKET"))
+	api := r.runtimeClient()
 
 	if !vm.ObjectMeta.DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(ctx, &vm, api, machineName)
@@ -114,6 +132,7 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	machine, err := api.GetMachine(ctx, machineName)
 	if smolvmapi.IsNotFound(err) {
 		createReq := buildCreateRequest(&vm, machineName)
+		logger.Info("creating smolvm machine", "machine", machineName)
 		machine, err = api.CreateMachine(ctx, createReq)
 		if err != nil {
 			return r.runtimeUnavailable(ctx, &vm, desiredNode, machineName, err)
@@ -167,6 +186,7 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			})
 		}
 		resize := buildResizeRequest(&vm)
+		logger.Info("resizing smolvm machine", "machine", machineName)
 		if err := api.ResizeMachine(ctx, machineName, resize); err != nil {
 			return r.runtimeUnavailable(ctx, &vm, desiredNode, machineName, err)
 		}
@@ -174,12 +194,14 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	if vm.Spec.Running && machine.State != "running" {
+		logger.Info("starting smolvm machine", "machine", machineName, "state", machine.State)
 		if err := api.EnsureMachineRunning(ctx, machineName); err != nil {
 			return r.runtimeUnavailable(ctx, &vm, desiredNode, machineName, err)
 		}
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
 	if !vm.Spec.Running && machine.State == "running" {
+		logger.Info("stopping smolvm machine", "machine", machineName)
 		if err := api.StopMachine(ctx, machineName); err != nil {
 			return r.runtimeUnavailable(ctx, &vm, desiredNode, machineName, err)
 		}
@@ -203,7 +225,7 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
-func (r *SmolVMReconciler) reconcileDelete(ctx context.Context, vm *vmv1alpha1.SmolVM, api *smolvmapi.Client, machineName string) (ctrl.Result, error) {
+func (r *SmolVMReconciler) reconcileDelete(ctx context.Context, vm *vmv1alpha1.SmolVM, api SmolVMRuntime, machineName string) (ctrl.Result, error) {
 	if machineName != "" {
 		if err := api.DeleteMachine(ctx, machineName); err != nil && !smolvmapi.IsNotFound(err) {
 			return r.runtimeUnavailable(ctx, vm, vm.Status.NodeName, machineName, err)
