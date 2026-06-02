@@ -7,39 +7,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  kvm-check:
-    name: kvm check
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check runner KVM access
-        run: |
-          uname -a
-          ls -l /dev/kvm || true
-          sudo chmod 666 /dev/kvm
-          ls -l /dev/kvm
-          python3 - <<'PY'
-          import os
-          try:
-              fd = os.open("/dev/kvm", os.O_RDWR)
-              print("KVM open: OK")
-              os.close(fd)
-          except Exception as e:
-              print("KVM open: FAIL:", e)
-              raise SystemExit(1)
-          PY
-
-  unit:
-    name: unit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-      - name: Run one pure unit test
-        run: go test ./internal/controller -run TestBuildCreateRequestMapsSpec -count=1
-
   envtest:
     name: envtest controller
     runs-on: ubuntu-latest
@@ -145,10 +112,22 @@ jobs:
             curl -fsS http://127.0.0.1:8080/api/v1/machines || true
             exit 1
           fi
+          test "$(kubectl get smolvm runtime-smoke -o jsonpath='{.status.conditions[?(@.type=="RuntimeReady")].status}')" = "True"
+          test "$(kubectl get smolvm runtime-smoke -o jsonpath='{.status.conditions[?(@.type=="GuestReady")].status}')" = "Unknown"
 
           kubectl patch smolvm runtime-smoke --type=merge -p '{"spec":{"running":false}}'
           kubectl wait smolvm runtime-smoke \
             --for=jsonpath='{.status.phase}'=Stopped \
             --timeout=5m
 
-          kubectl delete smolvm runtime-smoke --wait=false
+          machine=$(kubectl get smolvm runtime-smoke -o jsonpath='{.status.machineName}')
+          kubectl delete smolvm runtime-smoke --wait=true --timeout=5m
+          for i in {1..30}; do
+            if ! curl -fsS http://127.0.0.1:8080/api/v1/machines | grep -q "$machine"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "runtime machine $machine still exists after CR deletion"
+          curl -fsS http://127.0.0.1:8080/api/v1/machines || true
+          exit 1

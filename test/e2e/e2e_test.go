@@ -40,12 +40,27 @@ var _ = Describe("controller", Ordered, func() {
 		_, err = utils.Run(exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage)))
 		Expect(err).NotTo(HaveOccurred())
 
-		By("waiting for the controller deployment")
-		_, err = utils.Run(exec.Command("kubectl", "wait", "deployment", "operator-controller-manager", "-n", namespace, "--for=condition=Available", "--timeout=2m"))
+		By("waiting for the controller daemonset")
+		_, err = utils.Run(exec.Command("kubectl", "rollout", "status", "daemonset/operator-controller-manager", "-n", namespace, "--timeout=2m"))
 		Expect(err).NotTo(HaveOccurred())
 
-		By("applying a SmolVM resource")
-		_, err = utils.Run(exec.Command("kubectl", "apply", "-f", "config/samples/vm_v1alpha1_smolvm.yaml"))
+		By("applying a node-pinned SmolVM resource")
+		_, err = utils.Run(exec.Command("bash", "-c", `
+node=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+cat <<EOF | kubectl apply -f -
+apiVersion: vm.smolvm.dev/v1alpha1
+kind: SmolVM
+metadata:
+  name: smolvm-sample
+spec:
+  nodeName: ${node}
+  running: true
+  image: alpine:latest
+  resources:
+    cpus: 1
+    memoryMiB: 128
+EOF
+`))
 		Expect(err).NotTo(HaveOccurred())
 
 		By("observing runtime-unavailable status")

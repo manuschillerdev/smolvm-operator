@@ -89,3 +89,6 @@ Or over a Unix socket:
 ```sh
 SMOLVM_API_SOCKET=/var/run/smolvm/smolvm.sock make run
 ```
+
+The default Kubernetes DaemonSet manifest mounts `/var/run/smolvm` from each
+node and talks to `/var/run/smolvm/smolvm.sock`.

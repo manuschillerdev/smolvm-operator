@@ -56,9 +56,11 @@ spec:
                 description: |-
                   From is a path to a .smolmachine sidecar artifact available to the node runtime.
                   It is mutually exclusive with Image.
+                minLength: 1
                 type: string
               image:
                 description: Image is an OCI image to run inside the smolvm machine.
+                minLength: 1
                 type: string
               network:
                 description: Network configures outbound networking and host port
@@ -68,6 +70,7 @@ spec:
                     description: AllowedCIDRs restricts egress to the listed CIDR
                       ranges when supported by the runtime.
                     items:
+                      format: cidr
                       type: string
                     type: array
                   enabled:
@@ -96,6 +99,9 @@ spec:
                       - hostPort
                       type: object
                     type: array
+                    x-kubernetes-list-map-keys:
+                    - hostPort
+                    x-kubernetes-list-type: map
                 type: object
               nodeName:
                 description: |-
@@ -136,7 +142,16 @@ spec:
                     minimum: 1
                     type: integer
                 type: object
+            required:
+            - running
             type: object
+            x-kubernetes-validations:
+            - message: exactly one of spec.image or spec.from is required
+              rule: (has(self.image) && size(self.image) > 0) != (has(self.from) &&
+                size(self.from) > 0)
+            - message: spec.nodeName is immutable after binding
+              rule: '!has(oldSelf.nodeName) || (has(self.nodeName) && self.nodeName
+                == oldSelf.nodeName)'
           status:
             description: SmolVMStatus defines the observed state of a smolvm machine.
             properties:
@@ -201,6 +216,9 @@ spec:
                 description: MachineName is the stable smolvm runtime name owned by
                   this CR.
                 type: string
+              network:
+                description: Network is the runtime-observed network enablement.
+                type: boolean
               nodeName:
                 description: NodeName is the node currently owning this machine's
                   local state.
@@ -210,10 +228,45 @@ spec:
                   by the controller.
                 format: int64
                 type: integer
+              overlayGiB:
+                description: OverlayGiB is the runtime-observed overlay disk size.
+                format: int64
+                type: integer
               phase:
                 description: Phase is a compact machine phase such as Pending, Created,
                   Running, Stopped, Failed, or Unknown.
                 type: string
+              ports:
+                description: Ports are the runtime-observed host-to-guest port mappings.
+                items:
+                  description: SmolVMPort maps a node host port to a guest port.
+                  properties:
+                    guestPort:
+                      description: GuestPort is the TCP port inside the VM.
+                      format: int32
+                      maximum: 65535
+                      minimum: 1
+                      type: integer
+                    hostPort:
+                      description: HostPort is the TCP port opened on the node.
+                      format: int32
+                      maximum: 65535
+                      minimum: 1
+                      type: integer
+                  required:
+                  - guestPort
+                  - hostPort
+                  type: object
+                type: array
+              runtimePID:
+                description: RuntimePID is the local process ID reported by the smolvm
+                  runtime when available.
+                format: int32
+                type: integer
+              storageGiB:
+                description: StorageGiB is the runtime-observed storage disk size.
+                format: int64
+                type: integer
             type: object
         type: object
     served: true
