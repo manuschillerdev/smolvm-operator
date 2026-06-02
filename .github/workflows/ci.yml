@@ -123,9 +123,24 @@ jobs:
               memoryMiB: 128
           EOF
 
-          kubectl wait smolvm runtime-smoke \
-            --for=jsonpath='{.status.conditions[?(@.type=="Ready")].status}'=True \
-            --timeout=8m
+          ready=false
+          for i in {1..48}; do
+            echo "--- poll $i ---"
+            kubectl get smolvm runtime-smoke -o yaml || true
+            curl -fsS http://127.0.0.1:8080/api/v1/machines || true
+            status=$(kubectl get smolvm runtime-smoke -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+            if [ "$status" = "True" ]; then
+              ready=true
+              break
+            fi
+            sleep 10
+          done
+          if [ "$ready" != "true" ]; then
+            echo "runtime-smoke did not become Ready"
+            kubectl get smolvm runtime-smoke -o yaml || true
+            curl -fsS http://127.0.0.1:8080/api/v1/machines || true
+            exit 1
+          fi
 
           kubectl patch smolvm runtime-smoke --type=merge -p '{"spec":{"running":false}}'
           kubectl wait smolvm runtime-smoke \

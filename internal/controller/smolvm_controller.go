@@ -132,6 +132,7 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	machine, err := api.GetMachine(ctx, machineName)
 	if smolvmapi.IsNotFound(err) {
 		createReq := buildCreateRequest(&vm, machineName)
+		logger.Info("creating smolvm machine", "machine", machineName)
 		machine, err = api.CreateMachine(ctx, createReq)
 		if err != nil {
 			return r.runtimeUnavailable(ctx, &vm, desiredNode, machineName, err)
@@ -185,6 +186,7 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			})
 		}
 		resize := buildResizeRequest(&vm)
+		logger.Info("resizing smolvm machine", "machine", machineName)
 		if err := api.ResizeMachine(ctx, machineName, resize); err != nil {
 			return r.runtimeUnavailable(ctx, &vm, desiredNode, machineName, err)
 		}
@@ -192,12 +194,14 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	if vm.Spec.Running && machine.State != "running" {
+		logger.Info("starting smolvm machine", "machine", machineName, "state", machine.State)
 		if err := api.EnsureMachineRunning(ctx, machineName); err != nil {
 			return r.runtimeUnavailable(ctx, &vm, desiredNode, machineName, err)
 		}
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
 	if !vm.Spec.Running && machine.State == "running" {
+		logger.Info("stopping smolvm machine", "machine", machineName)
 		if err := api.StopMachine(ctx, machineName); err != nil {
 			return r.runtimeUnavailable(ctx, &vm, desiredNode, machineName, err)
 		}
