@@ -69,3 +69,68 @@ jobs:
           RUN_E2E: "true"
           KIND_CLUSTER: kind
         run: make test-e2e
+
+  smolvm-runtime-smoke:
+    name: smolvm runtime smoke
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: runtime
+      - name: Install smolvm
+        run: |
+          curl -fsSL -o /tmp/smolvm.tar.gz https://github.com/smol-machines/smolvm/releases/download/v0.8.1/smolvm-0.8.1-linux-x86_64.tar.gz
+          mkdir -p /tmp/smolvm
+          tar -xzf /tmp/smolvm.tar.gz -C /tmp/smolvm --strip-components=1
+          echo /tmp/smolvm >> "$GITHUB_PATH"
+          /tmp/smolvm/smolvm --version
+      - name: Run operator against real smolvm runtime
+        run: |
+          set -euxo pipefail
+          sudo chmod 666 /dev/kvm
+          smolvm serve start --listen 127.0.0.1:8080 > smolvm-serve.log 2>&1 &
+          serve_pid=$!
+          trap 'kubectl delete smolvm runtime-smoke --ignore-not-found=true --wait=false || true; kill $serve_pid || true; cat smolvm-serve.log || true' EXIT
+
+          for i in {1..60}; do
+            curl -fsS http://127.0.0.1:8080/api/v1/machines && break
+            sleep 1
+          done
+
+          make install
+          SMOLVM_API_URL=http://127.0.0.1:8080 go run ./cmd/main.go \
+            --metrics-bind-address=0 \
+            --health-probe-bind-address=:8081 > manager.log 2>&1 &
+          manager_pid=$!
+          trap 'kubectl delete smolvm runtime-smoke --ignore-not-found=true --wait=false || true; kill $manager_pid || true; kill $serve_pid || true; cat manager.log || true; cat smolvm-serve.log || true' EXIT
+
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: vm.smolvm.dev/v1alpha1
+          kind: SmolVM
+          metadata:
+            name: runtime-smoke
+          spec:
+            running: true
+            image: alpine:latest
+            resources:
+              cpus: 1
+              memoryMiB: 128
+          EOF
+
+          kubectl wait smolvm runtime-smoke \
+            --for=jsonpath='{.status.conditions[?(@.type=="Ready")].status}'=True \
+            --timeout=8m
+
+          kubectl patch smolvm runtime-smoke --type=merge -p '{"spec":{"running":false}}'
+          kubectl wait smolvm runtime-smoke \
+            --for=jsonpath='{.status.phase}'=Stopped \
+            --timeout=5m
+
+          kubectl delete smolvm runtime-smoke --wait=false
