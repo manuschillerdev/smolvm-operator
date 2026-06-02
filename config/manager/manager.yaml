@@ -110,6 +110,6 @@ spec:
       - name: smolvm-run
         hostPath:
           path: /var/run/smolvm
-          type: Directory
+          type: DirectoryOrCreate
       serviceAccountName: controller-manager
       terminationGracePeriodSeconds: 10
