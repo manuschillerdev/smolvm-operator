@@ -159,6 +159,7 @@ jobs:
           RUN_E2E: "true"
           E2E_INSTALL_MANIFEST: dist/install.yaml
           RUNTIME_E2E: "true"
+          KIND_CLUSTER: runtime
         run: make test-runtime-e2e-report
       - name: Upload runtime logs
         if: always()
@@ -171,6 +172,7 @@ jobs:
     name: upgrade multi-node and failure gates
     runs-on: ubuntu-latest
     needs: [envtest, release-artifact]
+    if: ${{ vars.PREVIOUS_INSTALL_MANIFEST_URL != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
