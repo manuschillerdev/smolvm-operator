@@ -25,6 +25,8 @@ import (
 	. "github.com/onsi/gomega"
 )
 
+const namespace = "operator-system"
+
 // Run e2e tests using the Ginkgo runner.
 func TestE2E(t *testing.T) {
 	if os.Getenv("RUN_E2E") != "true" {

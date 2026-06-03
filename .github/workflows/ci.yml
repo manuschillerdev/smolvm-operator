@@ -6,10 +6,27 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run linters
+        run: make lint
+
   envtest:
     name: envtest controller
     runs-on: ubuntu-latest
+    needs: [lint]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -25,8 +42,8 @@ jobs:
           name: envtest-reports
           path: reports/
 
-  kind-e2e:
-    name: kind topology e2e
+  release-artifact:
+    name: install artifact reproducibility
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,13 +51,68 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Build reproducible install artifact
+        run: make rc-artifacts VERSION=ci IMG=ghcr.io/${{ github.repository }}/smolvm-operator:${{ github.sha }} RUNTIME_IMG=ghcr.io/${{ github.repository }}/smolvm-runtime:${{ github.sha }}
+      - name: Upload install artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-artifact
+          path: dist/
+
+  container-images:
+    name: immutable container images
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish immutable images
+        run: |
+          docker build -t ghcr.io/${{ github.repository }}/smolvm-operator:${{ github.sha }} .
+          docker build -f Dockerfile.runtime --build-arg SMOLVM_VERSION=0.8.1 -t ghcr.io/${{ github.repository }}/smolvm-runtime:${{ github.sha }} .
+          docker push ghcr.io/${{ github.repository }}/smolvm-operator:${{ github.sha }}
+          docker push ghcr.io/${{ github.repository }}/smolvm-runtime:${{ github.sha }}
+
+  kind-e2e:
+    name: kind topology e2e
+    runs-on: ubuntu-latest
+    needs: [envtest, release-artifact]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Prepare KVM-backed multi-node kind mounts
+        run: |
+          set -euxo pipefail
+          test -e /dev/kvm
+          sudo chmod 666 /dev/kvm
+          for node in control-plane worker worker2; do
+            sudo mkdir -p "/tmp/smolvm-kind-${node}-var-lib" "/tmp/smolvm-kind-${node}-var-run"
+            sudo chmod 777 "/tmp/smolvm-kind-${node}-var-lib" "/tmp/smolvm-kind-${node}-var-run"
+          done
+      - name: Build e2e images and manifest
+        run: |
+          docker build -t smolvm-operator:e2e .
+          docker build -f Dockerfile.runtime --build-arg SMOLVM_VERSION=0.8.1 -t smolvm-runtime:e2e .
+          make build-installer IMG=smolvm-operator:e2e RUNTIME_IMG=smolvm-runtime:e2e
       - uses: helm/kind-action@v1
         with:
           cluster_name: kind
-      - name: Run deployed-topology e2e test
+          config: .github/kind-kvm-multinode-config.yaml
+      - name: Load e2e images
+        run: |
+          kind load docker-image smolvm-operator:e2e --name kind
+          kind load docker-image smolvm-runtime:e2e --name kind
+      - name: Run deployed topology e2e
         env:
           RUN_E2E: "true"
-          KIND_CLUSTER: kind
+          E2E_INSTALL_MANIFEST: dist/install.yaml
         run: make test-e2e-report
       - name: Upload e2e reports
         if: always()
@@ -52,6 +124,7 @@ jobs:
   smolvm-runtime-e2e:
     name: smolvm runtime lifecycle e2e
     runs-on: ubuntu-latest
+    needs: [envtest, release-artifact]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -59,26 +132,98 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Prepare KVM-backed kind mounts
+      - name: Prepare KVM-backed multi-node kind mounts
         run: |
           set -euxo pipefail
           test -e /dev/kvm
           sudo chmod 666 /dev/kvm
-          sudo mkdir -p /tmp/smolvm-kind-var-lib /tmp/smolvm-kind-var-run
-          sudo chmod 777 /tmp/smolvm-kind-var-lib /tmp/smolvm-kind-var-run
+          for node in control-plane worker worker2; do
+            sudo mkdir -p "/tmp/smolvm-kind-${node}-var-lib" "/tmp/smolvm-kind-${node}-var-run"
+            sudo chmod 777 "/tmp/smolvm-kind-${node}-var-lib" "/tmp/smolvm-kind-${node}-var-run"
+          done
+      - name: Build runtime e2e images and manifest
+        run: |
+          docker build -t smolvm-operator:runtime-e2e .
+          docker build -f Dockerfile.runtime --build-arg SMOLVM_VERSION=0.8.1 -t smolvm-runtime:runtime-e2e .
+          make build-installer IMG=smolvm-operator:runtime-e2e RUNTIME_IMG=smolvm-runtime:runtime-e2e
       - uses: helm/kind-action@v1
         with:
           cluster_name: runtime
-          config: .github/kind-runtime-config.yaml
+          config: .github/kind-kvm-multinode-config.yaml
+      - name: Load runtime e2e images
+        run: |
+          kind load docker-image smolvm-operator:runtime-e2e --name runtime
+          kind load docker-image smolvm-runtime:runtime-e2e --name runtime
       - name: Run runtime lifecycle e2e
         env:
           RUN_E2E: "true"
-          KIND_CLUSTER: runtime
+          E2E_INSTALL_MANIFEST: dist/install.yaml
           RUNTIME_E2E: "true"
+          KIND_CLUSTER: runtime
         run: make test-runtime-e2e-report
       - name: Upload runtime logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: runtime-e2e-logs
+          path: reports/
+
+  release-hardening-e2e:
+    name: upgrade multi-node and failure gates
+    runs-on: ubuntu-latest
+    needs: [envtest, release-artifact]
+    if: ${{ vars.PREVIOUS_INSTALL_MANIFEST_URL != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Prepare KVM-backed multi-node kind mounts
+        run: |
+          set -euxo pipefail
+          test -e /dev/kvm
+          sudo chmod 666 /dev/kvm
+          for node in control-plane worker worker2; do
+            sudo mkdir -p "/tmp/smolvm-kind-${node}-var-lib" "/tmp/smolvm-kind-${node}-var-run"
+            sudo chmod 777 "/tmp/smolvm-kind-${node}-var-lib" "/tmp/smolvm-kind-${node}-var-run"
+          done
+      - name: Build hardening e2e images and manifests
+        env:
+          PREVIOUS_INSTALL_MANIFEST_URL: ${{ vars.PREVIOUS_INSTALL_MANIFEST_URL }}
+        run: |
+          set -euxo pipefail
+          if [ -z "$PREVIOUS_INSTALL_MANIFEST_URL" ]; then
+            echo "PREVIOUS_INSTALL_MANIFEST_URL repository variable is required for upgrade e2e" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          curl -fsSL "$PREVIOUS_INSTALL_MANIFEST_URL" -o dist/previous-install.yaml
+          docker build -t smolvm-operator:rc .
+          docker build -f Dockerfile.runtime --build-arg SMOLVM_VERSION=0.8.1 -t smolvm-runtime:rc .
+          make build-installer IMG=smolvm-operator:rc RUNTIME_IMG=smolvm-runtime:rc
+          cp dist/install.yaml dist/rc-install.yaml
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: hardening
+          config: .github/kind-kvm-multinode-config.yaml
+      - name: Load hardening images
+        run: |
+          kind load docker-image smolvm-operator:rc --name hardening
+          kind load docker-image smolvm-runtime:rc --name hardening
+      - name: Run upgrade, multi-node, and failure checks
+        env:
+          RUN_E2E: "true"
+          E2E_INSTALL_MANIFEST: dist/rc-install.yaml
+          PREVIOUS_INSTALL_MANIFEST: dist/previous-install.yaml
+          RC_INSTALL_MANIFEST: dist/rc-install.yaml
+        run: |
+          make test-upgrade-e2e-report
+          make test-multinode-e2e-report
+          make test-failure-e2e-report
+      - name: Upload release hardening reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-hardening-reports
           path: reports/

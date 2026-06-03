@@ -86,22 +86,15 @@ var _ = Describe("runtime lifecycle", Label("runtime"), Ordered, func() {
 	})
 
 	It("waits for SmolVMNode Ready and RuntimeReady", func() {
-		nodeName := firstNodeName()
-		Expect(nodeName).NotTo(BeEmpty())
-
+		var nodeName string
 		Eventually(func(g Gomega) {
-			out, err := utils.Run(exec.Command("kubectl", "get", "smolvmnode", nodeName, "-o", "yaml"))
+			out, err := utils.Run(exec.Command("kubectl", "get", "smolvmnodes", "-o", "yaml"))
 			if err == nil {
 				fmt.Fprintln(GinkgoWriter, string(out))
 			}
 
-			ready, err := kubectlOutputE("get", "smolvmnode", nodeName, "-o", `jsonpath={.status.conditions[?(@.type=="Ready")].status}`)
-			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(ready).To(Equal("True"))
-
-			runtimeReady, err := kubectlOutputE("get", "smolvmnode", nodeName, "-o", `jsonpath={.status.conditions[?(@.type=="RuntimeReady")].status}`)
-			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(runtimeReady).To(Equal("True"))
+			nodeName = readyRuntimeNodeName()
+			g.Expect(nodeName).NotTo(BeEmpty())
 		}, 3*time.Minute, 2*time.Second).Should(Succeed())
 
 		Expect(kubectlOutput("get", "smolvmnode", nodeName, "-o", "jsonpath={.status.endpoint.podNamespace}")).To(Equal(namespace))
@@ -164,8 +157,18 @@ spec:
 	})
 })
 
-func firstNodeName() string {
-	return kubectlOutput("get", "nodes", "-o", "jsonpath={.items[0].metadata.name}")
+func readyRuntimeNodeName() string {
+	out, err := kubectlOutputE("get", "smolvmnodes", "-o", `jsonpath={range .items[*]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\t"}{.status.conditions[?(@.type=="RuntimeReady")].status}{"\n"}{end}`)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 3 && fields[1] == "True" && fields[2] == "True" {
+			return fields[0]
+		}
+	}
+	return ""
 }
 
 func kubectlOutput(args ...string) string {

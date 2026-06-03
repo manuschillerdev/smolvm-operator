@@ -77,14 +77,29 @@ test-e2e:
 	go test ./test/e2e/ -v -ginkgo.v
 
 .PHONY: test-e2e-report
-test-e2e-report: gotestsum ## Run e2e tests and write a JUnit report under reports/.
+test-e2e-report: gotestsum ## Run deployed topology e2e tests and write a JUnit report under reports/.
 	mkdir -p reports
-	$(GOTESTSUM) --format testname --junitfile reports/e2e.xml -- ./test/e2e/ -v -ginkgo.v
+	$(GOTESTSUM) --format testname --junitfile reports/e2e.xml -- ./test/e2e/ -v -ginkgo.v -ginkgo.label-filter='multinode || failure'
 
 .PHONY: test-runtime-e2e-report
 test-runtime-e2e-report: ## Run runtime lifecycle e2e tests and write a Ginkgo JUnit report under reports/.
 	mkdir -p reports
 	go test ./test/e2e -v -ginkgo.v -ginkgo.label-filter=runtime -ginkgo.junit-report=reports/runtime.xml
+
+.PHONY: test-upgrade-e2e-report
+test-upgrade-e2e-report: ## Run deployed upgrade e2e tests and write a Ginkgo JUnit report under reports/.
+	mkdir -p reports
+	go test ./test/e2e -v -ginkgo.v -ginkgo.label-filter=upgrade -ginkgo.junit-report=reports/upgrade.xml
+
+.PHONY: test-multinode-e2e-report
+test-multinode-e2e-report: ## Run deployed multi-node e2e tests and write a Ginkgo JUnit report under reports/.
+	mkdir -p reports
+	go test ./test/e2e -v -ginkgo.v -ginkgo.label-filter=multinode -ginkgo.junit-report=reports/multinode.xml
+
+.PHONY: test-failure-e2e-report
+test-failure-e2e-report: ## Run deployed failure-recovery e2e tests and write a Ginkgo JUnit report under reports/.
+	mkdir -p reports
+	go test ./test/e2e -v -ginkgo.v -ginkgo.label-filter=failure -ginkgo.junit-report=reports/failure.xml
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter & yamllint
@@ -139,15 +154,34 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 	rm Dockerfile.cross
 
 .PHONY: build-installer
-build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
+build-installer: manifests generate kustomize ## Generate a consolidated install manifest without mutating config/.
 	mkdir -p dist
-	@if [ -d "config/crd" ]; then \
-		$(KUSTOMIZE) build config/crd > dist/install.yaml; \
-	fi
-	echo "---" >> dist/install.yaml  # Add a document separator before appending
-	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	cd config/runtime && $(KUSTOMIZE) edit set image smolvm-runtime=${RUNTIME_IMG}
-	$(KUSTOMIZE) build config/default >> dist/install.yaml
+	out="$$(pwd)/dist/install.yaml"; \
+	tmpdir="$$(mktemp -d)"; \
+	trap 'rm -rf "$${tmpdir}"' EXIT; \
+	cp -R config "$${tmpdir}/config"; \
+	cd "$${tmpdir}/config/manager" && $(KUSTOMIZE) edit set image controller=${IMG}; \
+	cd "$${tmpdir}/config/runtime" && $(KUSTOMIZE) edit set image smolvm-runtime=${RUNTIME_IMG}; \
+	$(KUSTOMIZE) build "$${tmpdir}/config/default" > "$${out}"
+
+.PHONY: release-artifacts
+release-artifacts: build-installer ## Generate versioned release artifacts under dist/.
+	@if [ -z "$(VERSION)" ]; then echo "VERSION is required" >&2; exit 1; fi
+	cp dist/install.yaml dist/smolvm-operator-$(VERSION).yaml
+	shasum -a 256 dist/smolvm-operator-$(VERSION).yaml > dist/smolvm-operator-$(VERSION).yaml.sha256
+
+.PHONY: verify-release-artifacts
+verify-release-artifacts: release-artifacts ## Verify release artifacts are reproducible for the current inputs.
+	tmp="$$(mktemp)"; \
+	cp dist/smolvm-operator-$(VERSION).yaml "$${tmp}"; \
+	$(MAKE) release-artifacts VERSION=$(VERSION) IMG=$(IMG) RUNTIME_IMG=$(RUNTIME_IMG); \
+	cmp "$${tmp}" dist/smolvm-operator-$(VERSION).yaml
+
+.PHONY: rc-check
+rc-check: lint test-report test-e2e-report test-runtime-e2e-report test-upgrade-e2e-report test-multinode-e2e-report test-failure-e2e-report ## Run the release-candidate validation suite.
+
+.PHONY: rc-artifacts
+rc-artifacts: verify-release-artifacts ## Generate and verify RC install artifacts. Requires VERSION, IMG, and RUNTIME_IMG.
 
 ##@ Deployment
 
@@ -192,7 +226,7 @@ GOTESTSUM ?= $(LOCALBIN)/gotestsum-$(GOTESTSUM_VERSION)
 KUSTOMIZE_VERSION ?= v5.3.0
 CONTROLLER_TOOLS_VERSION ?= v0.19.0
 ENVTEST_VERSION ?= latest
-GOLANGCI_LINT_VERSION ?= v1.54.2
+GOLANGCI_LINT_VERSION ?= v1.64.8
 GOTESTSUM_VERSION ?= v1.13.0
 
 .PHONY: kustomize
