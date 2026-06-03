@@ -81,6 +81,11 @@ test-e2e-report: gotestsum ## Run e2e tests and write a JUnit report under repor
 	mkdir -p reports
 	$(GOTESTSUM) --format testname --junitfile reports/e2e.xml -- ./test/e2e/ -v -ginkgo.v
 
+.PHONY: test-runtime-e2e-report
+test-runtime-e2e-report: ## Run runtime lifecycle e2e tests and write a Ginkgo JUnit report under reports/.
+	mkdir -p reports
+	go test ./test/e2e -v -ginkgo.v -ginkgo.label-filter=runtime -ginkgo.junit-report=reports/runtime.xml
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter & yamllint
 	$(GOLANGCI_LINT) run
