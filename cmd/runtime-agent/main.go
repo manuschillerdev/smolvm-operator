@@ -473,7 +473,8 @@ func storageGiB(path string) int64 {
 	if err := syscall.Statfs(path, &stat); err != nil {
 		return 0
 	}
-	return int64(stat.Bavail) * int64(stat.Bsize) / 1024 / 1024 / 1024
+	bytesAvailable := uint64(stat.Bavail) * uint64(stat.Bsize) //nolint:unconvert
+	return int64(bytesAvailable / 1024 / 1024 / 1024)
 }
 
 func getenv(key, fallback string) string {
