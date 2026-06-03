@@ -1,47 +1,80 @@
 # smolvm operator
 
-Kubernetes controller for declaratively managing node-local smolvm machines.
+Kubernetes operator for declaratively managing node-local smolvm machines.
 
-The operator reconciles `SmolVM` custom resources into calls to a node-local
-`smolvm serve` API. It intentionally keeps Kubernetes reconciliation separate
-from the privileged VM runtime: the controller owns desired state, while the
-smolvm daemon owns KVM, libkrun, local disks, sockets, and machine processes.
+The default install deploys a cluster-level `smolvm-controller` Deployment and a
+node-local `smolvm-runtime` DaemonSet. Users do not run `smolvm serve` manually:
+the runtime DaemonSet owns KVM access, local state, the smolvm socket, runtime
+health, and `SmolVMNode` capability reporting.
 
-## Runtime contract
+## Architecture
 
-Each node that runs `SmolVM` resources needs:
+```text
+smolvm-controller Deployment
+  - schedules and reconciles SmolVMs
+  - writes SmolVM status and finalizers
+  - resolves node runtime endpoints from SmolVMNode
+  - calls the selected runtime over an authenticated node API
 
-- a running `smolvm serve` API
-- KVM access (`/dev/kvm` on Linux)
-- libkrun/libkrunfw and smolvm runtime assets
-- a persistent host-local smolvm state directory
-- protected API access, preferably through a Unix socket
+smolvm-runtime DaemonSet
+  - runs on eligible nodes
+  - supervises smolvm serve
+  - owns /dev/kvm, /var/lib/smolvm, and /var/run/smolvm
+  - exposes the per-node runtime API
+  - reports SmolVMNode status
+```
 
-The controller reads these environment variables:
+`SmolVMNode` is cluster-scoped. Object names match Kubernetes node names, and
+`status.nodeUID` lets the controller detect stale endpoints after node
+replacement.
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `SMOLVM_API_URL` | `http://127.0.0.1:8080` | smolvm API base URL |
-| `SMOLVM_API_SOCKET` | empty | Unix socket path; overrides network dialing when set |
-| `SMOLVM_NODE_NAME` | empty | node identity for node-local reconciliation |
+## Runtime API
 
-## Current MVP behavior
+The controller calls the runtime endpoint advertised in `SmolVMNode.status`.
+The default manifests use bearer-token authentication through the
+`smolvm-runtime-auth` Secret. Production installs should replace the default
+Secret value and may add certificate management and NetworkPolicy.
 
-The `SmolVM` reconciler supports:
+Runtime operations are node-local and idempotent:
 
-- stable smolvm machine names per CR
-- finalizer-based delete cleanup
-- create/start/stop/delete lifecycle
-- image or `.smolmachine` source selection
-- CPU/memory creation settings
-- storage/overlay creation settings
-- expand-only storage invariant checks
-- outbound networking and host port mappings
-- status phase and `Ready`/`Reconciled` conditions
-- runtime-unavailable backoff
+- `GetMachine`
+- `CreateMachine`
+- `EnsureMachineRunning`
+- `StopMachine`
+- `DeleteMachine`
+- `ResizeMachine`
+- `Health`
+- `Identity`
 
-This is an MVP controller, not a full pod runtime. Networking uses smolvm's
-current API model; it does not provide Kubernetes CNI/Pod-IP semantics.
+## Scheduling
+
+`spec.nodeName` is optional. If omitted, the controller selects an eligible
+`SmolVMNode` and records the immutable assignment in `status.nodeName`.
+
+Rules:
+
+- `spec.nodeName` is an optional hard pin.
+- `status.nodeName` is the actual binding.
+- bound VMs do not move automatically.
+- node/runtime loss updates status; it does not trigger silent migration.
+
+## Deletion
+
+Finalizers are node-aware. On delete, the controller calls the runtime endpoint
+for `status.nodeName` and removes the finalizer only after local deletion
+succeeds or the runtime reports the VM missing.
+
+If the owning runtime is unavailable, deletion is blocked with a condition. The
+escape hatch below removes the finalizer while accepting possible orphaned local
+state:
+
+```yaml
+metadata:
+  annotations:
+    vm.smolvm.dev/force-delete-local-state: "true"
+```
+
+When the runtime is available, the controller always attempts normal cleanup.
 
 ## Example
 
@@ -53,6 +86,8 @@ metadata:
 spec:
   running: true
   image: alpine:latest
+  nodeSelector:
+    kubernetes.io/arch: amd64
   resources:
     cpus: 1
     memoryMiB: 512
@@ -78,17 +113,10 @@ Install CRDs:
 make install
 ```
 
-Run locally against a smolvm API:
+Build and deploy the full operator stack:
 
 ```sh
-SMOLVM_API_URL=http://127.0.0.1:8080 make run
+make docker-build IMG=<registry>/smolvm-operator:<tag>
+make docker-build-runtime RUNTIME_IMG=<registry>/smolvm-runtime:<tag>
+make deploy IMG=<registry>/smolvm-operator:<tag> RUNTIME_IMG=<registry>/smolvm-runtime:<tag>
 ```
-
-Or over a Unix socket:
-
-```sh
-SMOLVM_API_SOCKET=/var/run/smolvm/smolvm.sock make run
-```
-
-The default Kubernetes DaemonSet manifest mounts `/var/run/smolvm` from each
-node and talks to `/var/run/smolvm/smolvm.sock`.

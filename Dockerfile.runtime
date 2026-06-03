@@ -1,0 +1,35 @@
+FROM golang:1.25-bookworm AS agent-builder
+WORKDIR /workspace
+COPY go.mod go.mod
+COPY go.sum go.sum
+RUN go mod download
+COPY cmd/ cmd/
+COPY api/ api/
+COPY internal/smolvm/ internal/smolvm/
+RUN CGO_ENABLED=0 go build -a -o /runtime-agent cmd/runtime-agent/main.go
+
+FROM debian:bookworm-slim AS smolvm-release
+ARG TARGETARCH
+ARG SMOLVM_VERSION=0.8.1
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl tar && rm -rf /var/lib/apt/lists/*
+WORKDIR /download
+RUN case "${TARGETARCH}" in \
+      amd64) SMOLVM_ARCH=x86_64 ;; \
+      arm64) SMOLVM_ARCH=aarch64 ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL -o smolvm.tar.gz "https://github.com/smol-machines/smolvm/releases/download/v${SMOLVM_VERSION}/smolvm-${SMOLVM_VERSION}-linux-${SMOLVM_ARCH}.tar.gz" && \
+    mkdir -p /opt/smolvm && \
+    tar -xzf smolvm.tar.gz -C /opt/smolvm --strip-components=1
+
+FROM ubuntu:24.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bash ca-certificates libepoxy0 libgbm1 libgcc-s1 libvirglrenderer1 && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /
+COPY --from=agent-builder /runtime-agent /runtime-agent
+COPY --from=smolvm-release /opt/smolvm/ /opt/smolvm/
+RUN chmod 0755 /runtime-agent /opt/smolvm/smolvm /opt/smolvm/smolvm-bin && \
+    ln -sf /opt/smolvm/smolvm /usr/local/bin/smolvm && \
+    mkdir -p /var/lib/smolvm /var/run/smolvm
+
+ENTRYPOINT ["/runtime-agent"]
