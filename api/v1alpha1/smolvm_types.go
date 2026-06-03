@@ -42,6 +42,10 @@ type SmolVMSpec struct {
 	//+optional
 	NodeName string `json:"nodeName,omitempty"`
 
+	// NodeSelector constrains automatic scheduling to nodes with matching labels.
+	//+optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
 	// Image is an OCI image to run inside the smolvm machine.
 	//+kubebuilder:validation:MinLength=1
 	//+optional

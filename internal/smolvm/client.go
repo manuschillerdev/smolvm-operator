@@ -3,6 +3,7 @@ package smolvm
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,15 +18,24 @@ import (
 type Client struct {
 	baseURL string
 	http    *http.Client
+	token   string
 }
 
 // NewClient creates a smolvm API client. If socketPath is non-empty, baseURL is
 // used only for URL construction and requests are transported over the socket.
 func NewClient(baseURL, socketPath string) *Client {
+	return NewClientWithAuth(baseURL, socketPath, "", false)
+}
+
+// NewClientWithAuth creates a smolvm API client with optional bearer-token auth.
+func NewClientWithAuth(baseURL, socketPath, token string, insecureSkipVerify bool) *Client {
 	if baseURL == "" {
 		baseURL = "http://127.0.0.1:8080"
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if insecureSkipVerify {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
+	}
 	if socketPath != "" {
 		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
@@ -34,6 +44,7 @@ func NewClient(baseURL, socketPath string) *Client {
 	}
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
+		token:   token,
 		http: &http.Client{
 			Timeout:   30 * time.Second,
 			Transport: transport,
@@ -56,6 +67,31 @@ type MachineInfo struct {
 
 type ListMachinesResponse struct {
 	Machines []MachineInfo `json:"machines"`
+}
+
+// Identity reports the runtime API node identity.
+type Identity struct {
+	NodeName string `json:"nodeName"`
+	NodeUID  string `json:"nodeUID,omitempty"`
+}
+
+// Health reports runtime health.
+type Health struct {
+	OK           bool   `json:"ok"`
+	KVMAvailable bool   `json:"kvmAvailable"`
+	SocketReady  bool   `json:"socketReady"`
+	StateReady   bool   `json:"stateReady"`
+	Message      string `json:"message,omitempty"`
+}
+
+// Capabilities reports runtime node resources and features.
+type Capabilities struct {
+	RuntimeVersion  string `json:"runtimeVersion,omitempty"`
+	ProtocolVersion string `json:"protocolVersion,omitempty"`
+	CPUs            int32  `json:"cpus,omitempty"`
+	MemoryMiB       int64  `json:"memoryMiB,omitempty"`
+	StorageGiB      int64  `json:"storageGiB,omitempty"`
+	KVMAvailable    bool   `json:"kvmAvailable"`
 }
 
 type CreateMachineRequest struct {
@@ -89,6 +125,38 @@ type ExecResponse struct {
 	ExitCode int32  `json:"exitCode"`
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
+}
+
+func (c *Client) Health(ctx context.Context) (*Health, error) {
+	var health Health
+	if err := c.request(ctx, http.MethodGet, "/healthz", nil, &health); err != nil {
+		return nil, err
+	}
+	return &health, nil
+}
+
+func (c *Client) GetIdentity(ctx context.Context) (*Identity, error) {
+	var identity Identity
+	if err := c.request(ctx, http.MethodGet, "/api/v1/identity", nil, &identity); err != nil {
+		return nil, err
+	}
+	return &identity, nil
+}
+
+func (c *Client) Capabilities(ctx context.Context) (*Capabilities, error) {
+	var capabilities Capabilities
+	if err := c.request(ctx, http.MethodGet, "/api/v1/capabilities", nil, &capabilities); err != nil {
+		return nil, err
+	}
+	return &capabilities, nil
+}
+
+func (c *Client) ListMachines(ctx context.Context) ([]MachineInfo, error) {
+	var result ListMachinesResponse
+	if err := c.request(ctx, http.MethodGet, "/api/v1/machines", nil, &result); err != nil {
+		return nil, err
+	}
+	return result.Machines, nil
 }
 
 func (c *Client) GetMachine(ctx context.Context, name string) (*MachineInfo, error) {
@@ -154,6 +222,9 @@ func (c *Client) request(ctx context.Context, method, path string, in, out any) 
 	}
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
 	resp, err := c.http.Do(req)

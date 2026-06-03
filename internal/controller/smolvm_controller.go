@@ -24,7 +24,11 @@ import (
 	"net"
 	"os"
 	"sort"
+	"strings"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,7 +38,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	vmv1alpha1 "github.com/manuschillerdev/smolvm-operator/api/v1alpha1"
 	smolvmapi "github.com/manuschillerdev/smolvm-operator/internal/smolvm"
@@ -52,6 +58,10 @@ type SmolVMReconciler struct {
 }
 
 type SmolVMRuntime interface {
+	Health(context.Context) (*smolvmapi.Health, error)
+	GetIdentity(context.Context) (*smolvmapi.Identity, error)
+	Capabilities(context.Context) (*smolvmapi.Capabilities, error)
+	ListMachines(context.Context) ([]smolvmapi.MachineInfo, error)
 	GetMachine(context.Context, string) (*smolvmapi.MachineInfo, error)
 	CreateMachine(context.Context, smolvmapi.CreateMachineRequest) (*smolvmapi.MachineInfo, error)
 	EnsureMachineRunning(context.Context, string) error
@@ -67,9 +77,51 @@ func (r *SmolVMReconciler) runtimeClient() SmolVMRuntime {
 	return smolvmapi.NewClient(os.Getenv("SMOLVM_API_URL"), os.Getenv("SMOLVM_API_SOCKET"))
 }
 
+func (r *SmolVMReconciler) runtimeForNode(ctx context.Context, nodeName string) (SmolVMRuntime, error) {
+	if r.RuntimeFactory != nil {
+		return r.RuntimeFactory(), nil
+	}
+	var node vmv1alpha1.SmolVMNode
+	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+		return nil, fmt.Errorf("get SmolVMNode %s: %w", nodeName, err)
+	}
+	if !smolVMNodeEligible(&node) {
+		return nil, fmt.Errorf("SmolVMNode %s is not ready or heartbeat is stale", nodeName)
+	}
+	endpoint := node.Status.Endpoint
+	if endpoint.PodIP == "" || endpoint.Port == 0 {
+		return nil, fmt.Errorf("SmolVMNode %s has no runtime endpoint", nodeName)
+	}
+	api := smolvmapi.NewClientWithAuth(fmt.Sprintf("https://%s:%d", endpoint.PodIP, endpoint.Port), "", os.Getenv("SMOLVM_RUNTIME_TOKEN"), os.Getenv("SMOLVM_RUNTIME_INSECURE_SKIP_VERIFY") == "true")
+	health, err := api.Health(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get runtime health for node %s: %w", nodeName, err)
+	}
+	if !health.OK {
+		return nil, fmt.Errorf("runtime for node %s is unhealthy: %s", nodeName, health.Message)
+	}
+	identity, err := api.GetIdentity(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get runtime identity for node %s: %w", nodeName, err)
+	}
+	if identity.NodeName != nodeName || (node.Status.NodeUID != "" && identity.NodeUID != "" && identity.NodeUID != node.Status.NodeUID) {
+		return nil, fmt.Errorf("runtime endpoint identity mismatch for node %s: got node=%s uid=%s", nodeName, identity.NodeName, identity.NodeUID)
+	}
+	capabilities, err := api.Capabilities(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get runtime capabilities for node %s: %w", nodeName, err)
+	}
+	if capabilities.ProtocolVersion != "" && capabilities.ProtocolVersion != node.Status.ProtocolVersion {
+		return nil, fmt.Errorf("runtime protocol mismatch for node %s: endpoint=%s status=%s", nodeName, capabilities.ProtocolVersion, node.Status.ProtocolVersion)
+	}
+	return api, nil
+}
+
 //+kubebuilder:rbac:groups=vm.smolvm.dev,resources=smolvms,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=vm.smolvm.dev,resources=smolvms/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=vm.smolvm.dev,resources=smolvms/finalizers,verbs=update
+//+kubebuilder:rbac:groups=vm.smolvm.dev,resources=smolvmnodes,verbs=get;list;watch
+//+kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -80,40 +132,15 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	runtimeNode := os.Getenv("SMOLVM_NODE_NAME")
-	desiredNode := vm.Spec.NodeName
 	ownerNode := vm.Status.NodeName
-	if ownerNode == "" {
-		ownerNode = desiredNode
-	}
 
 	machineName := vm.Status.MachineName
 	if machineName == "" {
 		machineName = stableMachineName(&vm)
 	}
 
-	if runtimeNode != "" && ownerNode == "" {
-		return r.updateStatus(ctx, &vm, statusInput{
-			Phase:       "Pending",
-			NodeName:    "",
-			MachineName: machineName,
-			Ready:       metav1.ConditionFalse,
-			ReadyReason: "AwaitingNodeAssignment",
-			ReadyMsg:    "spec.nodeName is required in node-local mode",
-			Recon:       metav1.ConditionFalse,
-			ReconReason: "AwaitingNodeAssignment",
-			ReconMsg:    "set spec.nodeName to a node running the smolvm controller",
-		})
-	}
-
-	if ownerNode != "" && runtimeNode != "" && ownerNode != runtimeNode {
-		return ctrl.Result{}, nil
-	}
-
-	api := r.runtimeClient()
-
 	if !vm.ObjectMeta.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, &vm, api, machineName, ownerNode)
+		return r.reconcileDelete(ctx, &vm, machineName, ownerNode)
 	}
 
 	if !controllerutil.ContainsFinalizer(&vm, vmv1alpha1.SmolVMFinalizer) {
@@ -135,6 +162,52 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			ReconReason: "InvalidSpec",
 			ReconMsg:    err.Error(),
 		})
+	}
+
+	if ownerNode == "" {
+		nodeName, msg, err := r.schedule(ctx, &vm)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if nodeName == "" {
+			return r.updateStatus(ctx, &vm, statusInput{
+				Phase:           "Pending",
+				NodeName:        "",
+				MachineName:     machineName,
+				Scheduled:       metav1.ConditionFalse,
+				ScheduledReason: "NoEligibleNodes",
+				ScheduledMsg:    msg,
+				Ready:           metav1.ConditionFalse,
+				ReadyReason:     "AwaitingNodeAssignment",
+				ReadyMsg:        msg,
+				Recon:           metav1.ConditionFalse,
+				ReconReason:     "AwaitingNodeAssignment",
+				ReconMsg:        msg,
+			})
+		}
+		_, statusErr := r.updateStatus(ctx, &vm, statusInput{
+			Phase:           "Scheduled",
+			NodeName:        nodeName,
+			MachineName:     machineName,
+			Scheduled:       metav1.ConditionTrue,
+			ScheduledReason: "Bound",
+			ScheduledMsg:    fmt.Sprintf("assigned to node %s", nodeName),
+			Ready:           metav1.ConditionFalse,
+			ReadyReason:     "Scheduled",
+			ReadyMsg:        "waiting for node runtime reconciliation",
+			Recon:           metav1.ConditionFalse,
+			ReconReason:     "RuntimePending",
+			ReconMsg:        "waiting for node runtime reconciliation",
+		})
+		if statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
+	}
+
+	api, err := r.runtimeForNode(ctx, ownerNode)
+	if err != nil {
+		return r.runtimeUnavailable(ctx, &vm, ownerNode, machineName, err)
 	}
 
 	machine, err := api.GetMachine(ctx, machineName)
@@ -257,12 +330,46 @@ func (r *SmolVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
-func (r *SmolVMReconciler) reconcileDelete(ctx context.Context, vm *vmv1alpha1.SmolVM, api SmolVMRuntime, machineName, ownerNode string) (ctrl.Result, error) {
-	if machineName != "" {
-		r.event(vm, "Normal", "Deleting", fmt.Sprintf("deleting smolvm machine %s", machineName))
-		if err := api.DeleteMachine(ctx, machineName); err != nil && !smolvmapi.IsNotFound(err) {
-			return r.runtimeUnavailable(ctx, vm, ownerNode, machineName, err)
+func (r *SmolVMReconciler) reconcileDelete(ctx context.Context, vm *vmv1alpha1.SmolVM, machineName, ownerNode string) (ctrl.Result, error) {
+	if ownerNode == "" || machineName == "" {
+		controllerutil.RemoveFinalizer(vm, vmv1alpha1.SmolVMFinalizer)
+		return ctrl.Result{}, r.Update(ctx, vm)
+	}
+
+	api, err := r.runtimeForNode(ctx, ownerNode)
+	if err != nil {
+		if vm.Annotations[vmv1alpha1.ForceDeleteLocalStateAnnotation] == "true" {
+			r.event(vm, "Warning", "ForceDeleteLocalState", fmt.Sprintf("removing finalizer while runtime for node %s is unavailable; local VM state may remain", ownerNode))
+			controllerutil.RemoveFinalizer(vm, vmv1alpha1.SmolVMFinalizer)
+			return ctrl.Result{}, r.Update(ctx, vm)
 		}
+		r.event(vm, "Warning", "DeletionBlocked", err.Error())
+		_, statusErr := r.updateStatus(ctx, vm, statusInput{
+			Phase:                 "Deleting",
+			NodeName:              ownerNode,
+			MachineName:           machineName,
+			Scheduled:             metav1.ConditionTrue,
+			ScheduledReason:       "Bound",
+			ScheduledMsg:          fmt.Sprintf("assigned to node %s", ownerNode),
+			Ready:                 metav1.ConditionFalse,
+			ReadyReason:           "RuntimeUnavailable",
+			ReadyMsg:              err.Error(),
+			Recon:                 metav1.ConditionFalse,
+			ReconReason:           "DeletionBlocked",
+			ReconMsg:              err.Error(),
+			DeletionBlocked:       metav1.ConditionTrue,
+			DeletionBlockedReason: "RuntimeUnavailable",
+			DeletionBlockedMsg:    fmt.Sprintf("owning node %s is unavailable; local VM state may still exist", ownerNode),
+		})
+		if statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
+	}
+
+	r.event(vm, "Normal", "Deleting", fmt.Sprintf("deleting smolvm machine %s", machineName))
+	if err := api.DeleteMachine(ctx, machineName); err != nil && !smolvmapi.IsNotFound(err) {
+		return r.runtimeUnavailable(ctx, vm, ownerNode, machineName, err)
 	}
 	controllerutil.RemoveFinalizer(vm, vmv1alpha1.SmolVMFinalizer)
 	return ctrl.Result{}, r.Update(ctx, vm)
@@ -288,16 +395,22 @@ func (r *SmolVMReconciler) runtimeUnavailable(ctx context.Context, vm *vmv1alpha
 }
 
 type statusInput struct {
-	Phase       string
-	NodeName    string
-	MachineName string
-	Machine     *smolvmapi.MachineInfo
-	Ready       metav1.ConditionStatus
-	ReadyReason string
-	ReadyMsg    string
-	Recon       metav1.ConditionStatus
-	ReconReason string
-	ReconMsg    string
+	Phase                 string
+	NodeName              string
+	MachineName           string
+	Machine               *smolvmapi.MachineInfo
+	Scheduled             metav1.ConditionStatus
+	ScheduledReason       string
+	ScheduledMsg          string
+	Ready                 metav1.ConditionStatus
+	ReadyReason           string
+	ReadyMsg              string
+	Recon                 metav1.ConditionStatus
+	ReconReason           string
+	ReconMsg              string
+	DeletionBlocked       metav1.ConditionStatus
+	DeletionBlockedReason string
+	DeletionBlockedMsg    string
 }
 
 func (r *SmolVMReconciler) updateStatus(ctx context.Context, vm *vmv1alpha1.SmolVM, in statusInput) (ctrl.Result, error) {
@@ -317,10 +430,21 @@ func (r *SmolVMReconciler) updateStatus(ctx context.Context, vm *vmv1alpha1.Smol
 		latest.Status.OverlayGiB = in.Machine.OverlayGB
 	}
 	latest.Status.ObservedGeneration = latest.Generation
+	if in.ScheduledReason == "" && in.NodeName != "" {
+		in.Scheduled = metav1.ConditionTrue
+		in.ScheduledReason = "Bound"
+		in.ScheduledMsg = fmt.Sprintf("assigned to node %s", in.NodeName)
+	}
+	if in.ScheduledReason != "" {
+		setCondition(&latest.Status.Conditions, vmv1alpha1.ConditionScheduled, in.Scheduled, in.ScheduledReason, in.ScheduledMsg, latest.Generation)
+	}
 	setCondition(&latest.Status.Conditions, vmv1alpha1.ConditionReady, in.Ready, in.ReadyReason, in.ReadyMsg, latest.Generation)
 	setCondition(&latest.Status.Conditions, vmv1alpha1.ConditionRuntimeReady, in.Ready, in.ReadyReason, in.ReadyMsg, latest.Generation)
 	setCondition(&latest.Status.Conditions, vmv1alpha1.ConditionGuestReady, metav1.ConditionUnknown, "GuestReadinessUnavailable", "smolvm guest readiness is not reported by the runtime API", latest.Generation)
 	setCondition(&latest.Status.Conditions, vmv1alpha1.ConditionReconciled, in.Recon, in.ReconReason, in.ReconMsg, latest.Generation)
+	if in.DeletionBlockedReason != "" {
+		setCondition(&latest.Status.Conditions, vmv1alpha1.ConditionDeletionBlocked, in.DeletionBlocked, in.DeletionBlockedReason, in.DeletionBlockedMsg, latest.Generation)
+	}
 	if apiequality.Semantic.DeepEqual(previous, &latest.Status) {
 		return ctrl.Result{}, nil
 	}
@@ -348,6 +472,171 @@ func setCondition(conditions *[]metav1.Condition, typ string, status metav1.Cond
 		ObservedGeneration: generation,
 		LastTransitionTime: metav1.Now(),
 	})
+}
+
+func (r *SmolVMReconciler) schedule(ctx context.Context, vm *vmv1alpha1.SmolVM) (string, string, error) {
+	bound, err := r.boundVMs(ctx, vm)
+	if err != nil {
+		return "", "", err
+	}
+	if vm.Spec.NodeName != "" {
+		var node vmv1alpha1.SmolVMNode
+		if err := r.Get(ctx, types.NamespacedName{Name: vm.Spec.NodeName}, &node); err != nil {
+			if apierrors.IsNotFound(err) {
+				return "", fmt.Sprintf("pinned node %s has no SmolVMNode runtime status", vm.Spec.NodeName), nil
+			}
+			return "", "", err
+		}
+		if reason := r.nodeRejectReason(ctx, &node, vm, bound); reason != "" {
+			return "", fmt.Sprintf("pinned node %s is not eligible: %s", vm.Spec.NodeName, reason), nil
+		}
+		return node.Name, "", nil
+	}
+
+	var nodes vmv1alpha1.SmolVMNodeList
+	if err := r.List(ctx, &nodes); err != nil {
+		return "", "", err
+	}
+	var reasons []string
+	for _, node := range nodes.Items {
+		if reason := r.nodeRejectReason(ctx, &node, vm, bound); reason != "" {
+			reasons = append(reasons, fmt.Sprintf("%s: %s", node.Name, reason))
+			continue
+		}
+		return node.Name, "", nil
+	}
+	if len(reasons) == 0 {
+		return "", "no SmolVMNode objects exist", nil
+	}
+	return "", "no ready SmolVMNode matches this VM: " + strings.Join(reasons, "; "), nil
+}
+
+func (r *SmolVMReconciler) nodeRejectReason(ctx context.Context, node *vmv1alpha1.SmolVMNode, vm *vmv1alpha1.SmolVM, bound []vmv1alpha1.SmolVM) string {
+	if !smolVMNodeEligible(node) {
+		return "runtime not ready, heartbeat stale, or endpoint missing"
+	}
+	if !matchesNodeSelector(node, vm.Spec.NodeSelector) {
+		return "nodeSelector does not match"
+	}
+	var k8sNode corev1.Node
+	if err := r.Get(ctx, types.NamespacedName{Name: node.Name}, &k8sNode); err != nil {
+		return fmt.Sprintf("Kubernetes Node unavailable: %v", err)
+	}
+	if k8sNode.Spec.Unschedulable {
+		return "Kubernetes Node is unschedulable"
+	}
+	if !kubernetesNodeReady(&k8sNode) {
+		return "Kubernetes Node is not Ready"
+	}
+	if reason := resourceFitReason(node, vm, bound); reason != "" {
+		return reason
+	}
+	if reason := hostPortConflictReason(node.Name, vm, bound); reason != "" {
+		return reason
+	}
+	return ""
+}
+
+func (r *SmolVMReconciler) boundVMs(ctx context.Context, pending *vmv1alpha1.SmolVM) ([]vmv1alpha1.SmolVM, error) {
+	var list vmv1alpha1.SmolVMList
+	if err := r.List(ctx, &list); err != nil {
+		return nil, err
+	}
+	out := make([]vmv1alpha1.SmolVM, 0, len(list.Items))
+	for _, item := range list.Items {
+		if item.UID == pending.UID || item.Status.NodeName == "" || !item.DeletionTimestamp.IsZero() {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
+func kubernetesNodeReady(node *corev1.Node) bool {
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == corev1.NodeReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func resourceFitReason(node *vmv1alpha1.SmolVMNode, vm *vmv1alpha1.SmolVM, bound []vmv1alpha1.SmolVM) string {
+	usedCPU, usedMemory, usedStorage := int32(0), int64(0), int64(0)
+	for _, existing := range bound {
+		if existing.Status.NodeName != node.Name {
+			continue
+		}
+		usedCPU += existing.Spec.Resources.CPUs
+		usedMemory += int64(existing.Spec.Resources.MemoryMiB)
+		usedStorage += existing.Spec.Storage.StorageGiB + existing.Spec.Storage.OverlayGiB
+	}
+	if node.Status.Allocatable.CPUs > 0 && usedCPU+vm.Spec.Resources.CPUs > node.Status.Allocatable.CPUs {
+		return fmt.Sprintf("insufficient cpu: requested %d used %d allocatable %d", vm.Spec.Resources.CPUs, usedCPU, node.Status.Allocatable.CPUs)
+	}
+	if node.Status.Allocatable.MemoryMiB > 0 && usedMemory+int64(vm.Spec.Resources.MemoryMiB) > node.Status.Allocatable.MemoryMiB {
+		return fmt.Sprintf("insufficient memory: requested %dMiB used %dMiB allocatable %dMiB", vm.Spec.Resources.MemoryMiB, usedMemory, node.Status.Allocatable.MemoryMiB)
+	}
+	requestedStorage := vm.Spec.Storage.StorageGiB + vm.Spec.Storage.OverlayGiB
+	if node.Status.Allocatable.StorageGiB > 0 && usedStorage+requestedStorage > node.Status.Allocatable.StorageGiB {
+		return fmt.Sprintf("insufficient storage: requested %dGiB used %dGiB allocatable %dGiB", requestedStorage, usedStorage, node.Status.Allocatable.StorageGiB)
+	}
+	return ""
+}
+
+func hostPortConflictReason(nodeName string, vm *vmv1alpha1.SmolVM, bound []vmv1alpha1.SmolVM) string {
+	requested := map[int32]struct{}{}
+	for _, port := range vm.Spec.Network.Ports {
+		requested[port.HostPort] = struct{}{}
+	}
+	if len(requested) == 0 {
+		return ""
+	}
+	for _, existing := range bound {
+		if existing.Status.NodeName != nodeName {
+			continue
+		}
+		for _, port := range existing.Spec.Network.Ports {
+			if _, ok := requested[port.HostPort]; ok {
+				return fmt.Sprintf("hostPort %d conflicts with %s/%s", port.HostPort, existing.Namespace, existing.Name)
+			}
+		}
+	}
+	return ""
+}
+
+func smolVMNodeEligible(node *vmv1alpha1.SmolVMNode) bool {
+	if !hasCondition(node.Status.Conditions, vmv1alpha1.SmolVMNodeConditionReady, metav1.ConditionTrue) ||
+		!hasCondition(node.Status.Conditions, vmv1alpha1.SmolVMNodeConditionKVMAvailable, metav1.ConditionTrue) ||
+		!hasCondition(node.Status.Conditions, vmv1alpha1.SmolVMNodeConditionRuntimeReady, metav1.ConditionTrue) ||
+		!hasCondition(node.Status.Conditions, vmv1alpha1.SmolVMNodeConditionSchedulable, metav1.ConditionTrue) {
+		return false
+	}
+	if node.Status.ProtocolVersion != "" && node.Status.ProtocolVersion != "v1alpha1" {
+		return false
+	}
+	if node.Status.HeartbeatTime == nil || time.Since(node.Status.HeartbeatTime.Time) > 2*time.Minute {
+		return false
+	}
+	return node.Status.Endpoint.PodIP != "" && node.Status.Endpoint.Port > 0
+}
+
+func hasCondition(conditions []metav1.Condition, typ string, status metav1.ConditionStatus) bool {
+	for _, condition := range conditions {
+		if condition.Type == typ && condition.Status == status {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesNodeSelector(node *vmv1alpha1.SmolVMNode, selector map[string]string) bool {
+	for key, value := range selector {
+		if node.Labels[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func validateSpec(vm *vmv1alpha1.SmolVM) error {
@@ -501,6 +790,20 @@ func (r *SmolVMReconciler) event(vm *vmv1alpha1.SmolVM, eventType, reason, messa
 	}
 }
 
+func (r *SmolVMReconciler) requestsForNodeChange(ctx context.Context, nodeName string) []reconcile.Request {
+	var vms vmv1alpha1.SmolVMList
+	if err := r.List(ctx, &vms); err != nil {
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(vms.Items))
+	for _, vm := range vms.Items {
+		if vm.Status.NodeName == nodeName || (vm.Status.NodeName == "" && (vm.Spec.NodeName == "" || vm.Spec.NodeName == nodeName)) {
+			requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Name: vm.Name, Namespace: vm.Namespace}})
+		}
+	}
+	return requests
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *SmolVMReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
@@ -508,5 +811,11 @@ func (r *SmolVMReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&vmv1alpha1.SmolVM{}).
+		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+			return r.requestsForNodeChange(ctx, obj.GetName())
+		})).
+		Watches(&vmv1alpha1.SmolVMNode{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+			return r.requestsForNodeChange(ctx, obj.GetName())
+		})).
 		Complete(r)
 }

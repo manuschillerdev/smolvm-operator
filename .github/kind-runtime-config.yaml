@@ -1,0 +1,11 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  extraMounts:
+  - hostPath: /dev/kvm
+    containerPath: /dev/kvm
+  - hostPath: /tmp/smolvm-kind-var-lib
+    containerPath: /var/lib/smolvm
+  - hostPath: /tmp/smolvm-kind-var-run
+    containerPath: /var/run/smolvm

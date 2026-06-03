@@ -12,6 +12,34 @@ rules:
   - create
   - patch
 - apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - vm.smolvm.dev
+  resources:
+  - smolvmnodes
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - vm.smolvm.dev
+  resources:
+  - smolvmnodes/status
+  - smolvms/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
   - vm.smolvm.dev
   resources:
   - smolvms
@@ -28,12 +56,4 @@ rules:
   resources:
   - smolvms/finalizers
   verbs:
-  - update
-- apiGroups:
-  - vm.smolvm.dev
-  resources:
-  - smolvms/status
-  verbs:
-  - get
-  - patch
   - update

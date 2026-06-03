@@ -17,10 +17,16 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Run controller-runtime envtest
-        run: make test
+        run: make test-report
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: envtest-reports
+          path: reports/
 
   kind-e2e:
-    name: kind e2e
+    name: kind topology e2e
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,56 +37,123 @@ jobs:
       - uses: helm/kind-action@v1
         with:
           cluster_name: kind
-      - name: Run one deployment e2e test
+      - name: Run deployed-topology e2e test
         env:
           RUN_E2E: "true"
           KIND_CLUSTER: kind
-        run: make test-e2e
+        run: make test-e2e-report
+      - name: Upload e2e reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-reports
+          path: reports/
 
-  smolvm-runtime-smoke:
-    name: smolvm runtime smoke
+  smolvm-runtime-e2e:
+    name: smolvm runtime lifecycle e2e
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+      - name: Prepare KVM-backed kind mounts
+        run: |
+          set -euxo pipefail
+          test -e /dev/kvm
+          sudo chmod 666 /dev/kvm
+          sudo mkdir -p /tmp/smolvm-kind-var-lib /tmp/smolvm-kind-var-run
+          sudo chmod 777 /tmp/smolvm-kind-var-lib /tmp/smolvm-kind-var-run
       - uses: helm/kind-action@v1
         with:
           cluster_name: runtime
-      - name: Install smolvm
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libvirglrenderer1 libepoxy0 libgbm1
-          curl -fsSL -o /tmp/smolvm.tar.gz https://github.com/smol-machines/smolvm/releases/download/v0.8.1/smolvm-0.8.1-linux-x86_64.tar.gz
-          mkdir -p /tmp/smolvm
-          tar -xzf /tmp/smolvm.tar.gz -C /tmp/smolvm --strip-components=1
-          echo /tmp/smolvm >> "$GITHUB_PATH"
-          /tmp/smolvm/smolvm --version
-      - name: Run operator against real smolvm runtime
+          config: .github/kind-runtime-config.yaml
+      - name: Build and load operator images
         run: |
           set -euxo pipefail
-          sudo chmod 666 /dev/kvm
-          export LD_LIBRARY_PATH="/tmp/smolvm/lib:${LD_LIBRARY_PATH:-}"
-          export LD_PRELOAD="$(find /usr/lib -name 'libvirglrenderer.so.1' | head -1)"
-          smolvm serve start --listen 127.0.0.1:8080 > smolvm-serve.log 2>&1 &
-          serve_pid=$!
-          trap 'kubectl delete smolvm runtime-smoke --ignore-not-found=true --wait=false || true; kill $serve_pid || true; cat smolvm-serve.log || true' EXIT
+          make docker-build IMG=example.com/smolvm-operator:e2e
+          make docker-build-runtime RUNTIME_IMG=example.com/smolvm-runtime:e2e
+          docker run --rm --entrypoint smolvm example.com/smolvm-runtime:e2e --version
+          docker run --rm --entrypoint /runtime-agent example.com/smolvm-runtime:e2e --help
+          kind load docker-image example.com/smolvm-operator:e2e --name runtime
+          kind load docker-image example.com/smolvm-runtime:e2e --name runtime
+      - name: Deploy full stack and run VM lifecycle
+        run: |
+          set -euxo pipefail
+          mkdir -p reports
+          current_step="install"
+          write_runtime_report() {
+            local status="$1"
+            local failed_step="${2:-}"
+            if [ "$status" = "pass" ]; then
+              cat > reports/runtime.xml <<'EOF'
+          <testsuite name="smolvm runtime lifecycle e2e" tests="9" failures="0" errors="0">
+            <testcase classname="runtime" name="install CRDs"/>
+            <testcase classname="runtime" name="deploy controller Deployment and runtime DaemonSet"/>
+            <testcase classname="runtime" name="runtime DaemonSet rolls out"/>
+            <testcase classname="runtime" name="SmolVMNode reports Ready and RuntimeReady"/>
+            <testcase classname="runtime" name="create unpinned SmolVM"/>
+            <testcase classname="runtime" name="SmolVM is scheduled and Running"/>
+            <testcase classname="runtime" name="patch spec.running false"/>
+            <testcase classname="runtime" name="SmolVM reaches Stopped"/>
+            <testcase classname="runtime" name="delete CR cleans runtime machine"/>
+          </testsuite>
+          EOF
+              return
+            fi
+            cat > reports/runtime.xml <<EOF
+          <testsuite name="smolvm runtime lifecycle e2e" tests="1" failures="1" errors="0">
+            <testcase classname="runtime" name="${failed_step}">
+              <failure message="runtime lifecycle e2e failed at ${failed_step}"/>
+            </testcase>
+          </testsuite>
+          EOF
+          }
+          cleanup() {
+            status=$?
+            if [ ! -f reports/runtime.xml ]; then
+              if [ "$status" -eq 0 ]; then
+                write_runtime_report pass
+              else
+                write_runtime_report fail "$current_step"
+              fi
+            fi
+            kubectl delete smolvm runtime-smoke --ignore-not-found=true --wait=false || true
+            kubectl -n operator-system get pods -o wide || true
+            kubectl -n operator-system logs deployment/operator-controller-manager --all-containers=true || true
+            kubectl -n operator-system logs daemonset/operator-smolvm-runtime --all-containers=true || true
+            exit "$status"
+          }
+          trap cleanup EXIT
 
-          for i in {1..60}; do
-            curl -fsS http://127.0.0.1:8080/api/v1/machines && break
-            sleep 1
-          done
-
+          current_step="install CRDs"
           make install
-          SMOLVM_API_URL=http://127.0.0.1:8080 go run ./cmd/main.go \
-            --metrics-bind-address=0 \
-            --health-probe-bind-address=:8081 > manager.log 2>&1 &
-          manager_pid=$!
-          trap 'kubectl delete smolvm runtime-smoke --ignore-not-found=true --wait=false || true; kill $manager_pid || true; kill $serve_pid || true; cat manager.log || true; cat smolvm-serve.log || true' EXIT
+          current_step="deploy full operator stack"
+          make deploy IMG=example.com/smolvm-operator:e2e RUNTIME_IMG=example.com/smolvm-runtime:e2e
 
+          current_step="controller Deployment rollout"
+          kubectl rollout status deployment/operator-controller-manager -n operator-system --timeout=3m
+          current_step="runtime DaemonSet rollout"
+          kubectl rollout status daemonset/operator-smolvm-runtime -n operator-system --timeout=5m
+
+          current_step="SmolVMNode readiness"
+          node=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+          for i in {1..90}; do
+            kubectl get smolvmnode "$node" -o yaml || true
+            ready=$(kubectl get smolvmnode "$node" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+            runtime_ready=$(kubectl get smolvmnode "$node" -o jsonpath='{.status.conditions[?(@.type=="RuntimeReady")].status}' 2>/dev/null || true)
+            if [ "$ready" = "True" ] && [ "$runtime_ready" = "True" ]; then
+              break
+            fi
+            sleep 2
+          done
+          test "$(kubectl get smolvmnode "$node" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True"
+          test "$(kubectl get smolvmnode "$node" -o jsonpath='{.status.conditions[?(@.type=="RuntimeReady")].status}')" = "True"
+          test "$(kubectl get smolvmnode "$node" -o jsonpath='{.status.endpoint.podNamespace}')" = "operator-system"
+
+          current_step="create unpinned SmolVM"
           cat <<'EOF' | kubectl apply -f -
           apiVersion: vm.smolvm.dev/v1alpha1
           kind: SmolVM
@@ -94,40 +167,40 @@ jobs:
               memoryMiB: 128
           EOF
 
-          ready=false
-          for i in {1..48}; do
-            echo "--- poll $i ---"
+          current_step="SmolVM reaches Running"
+          for i in {1..60}; do
             kubectl get smolvm runtime-smoke -o yaml || true
-            curl -fsS http://127.0.0.1:8080/api/v1/machines || true
             status=$(kubectl get smolvm runtime-smoke -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
             if [ "$status" = "True" ]; then
-              ready=true
               break
             fi
             sleep 10
           done
-          if [ "$ready" != "true" ]; then
-            echo "runtime-smoke did not become Ready"
-            kubectl get smolvm runtime-smoke -o yaml || true
-            curl -fsS http://127.0.0.1:8080/api/v1/machines || true
-            exit 1
-          fi
+          test "$(kubectl get smolvm runtime-smoke -o jsonpath='{.status.conditions[?(@.type=="Scheduled")].reason}')" = "Bound"
           test "$(kubectl get smolvm runtime-smoke -o jsonpath='{.status.conditions[?(@.type=="RuntimeReady")].status}')" = "True"
-          test "$(kubectl get smolvm runtime-smoke -o jsonpath='{.status.conditions[?(@.type=="GuestReady")].status}')" = "Unknown"
+          test "$(kubectl get smolvm runtime-smoke -o jsonpath='{.status.phase}')" = "Running"
 
+          current_step="patch spec.running false"
           kubectl patch smolvm runtime-smoke --type=merge -p '{"spec":{"running":false}}'
-          kubectl wait smolvm runtime-smoke \
-            --for=jsonpath='{.status.phase}'=Stopped \
-            --timeout=5m
+          current_step="SmolVM reaches Stopped"
+          kubectl wait smolvm runtime-smoke --for=jsonpath='{.status.phase}'=Stopped --timeout=5m
 
+          current_step="delete CR cleans runtime machine"
           machine=$(kubectl get smolvm runtime-smoke -o jsonpath='{.status.machineName}')
+          runtime_pod=$(kubectl -n operator-system get pod -l app.kubernetes.io/name=smolvm-runtime -o jsonpath='{.items[0].metadata.name}')
           kubectl delete smolvm runtime-smoke --wait=true --timeout=5m
           for i in {1..30}; do
-            if ! curl -fsS http://127.0.0.1:8080/api/v1/machines | grep -q "$machine"; then
+            if ! kubectl -n operator-system exec "$runtime_pod" -- smolvm machine ls | grep -q "$machine"; then
               exit 0
             fi
             sleep 2
           done
           echo "runtime machine $machine still exists after CR deletion"
-          curl -fsS http://127.0.0.1:8080/api/v1/machines || true
+          kubectl -n operator-system exec "$runtime_pod" -- smolvm machine ls || true
           exit 1
+      - name: Upload runtime logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-e2e-logs
+          path: reports/

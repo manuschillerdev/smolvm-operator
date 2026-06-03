@@ -2,10 +2,18 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
+	"strconv"
 	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -105,18 +113,111 @@ func TestBuildCreateRequestMapsSpec(t *testing.T) {
 }
 
 var _ = Describe("SmolVM Controller", func() {
+	It("schedules an unpinned VM to a ready SmolVMNode and calls that runtime endpoint", func() {
+		ctx := context.Background()
+		runtime := newRuntimeHTTPServer("node-schedule", "uid-schedule")
+		defer runtime.Close()
+		Expect(createReadyNode(ctx, "node-schedule", "uid-schedule")).To(Succeed())
+		Expect(createReadySmolVMNode(ctx, "node-schedule", "uid-schedule", runtime.host(), runtime.port(), vmv1alpha1.SmolVMNodeAllocatable{CPUs: 4, MemoryMiB: 4096, StorageGiB: 100})).To(Succeed())
+
+		name := types.NamespacedName{Name: "schedule-unpinned", Namespace: "default"}
+		Expect(k8sClient.Create(ctx, testSmolVM(name, ""))).To(Succeed())
+		reconciler := clusterReconciler()
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
+		Expect(err).NotTo(HaveOccurred())
+
+		latest := &vmv1alpha1.SmolVM{}
+		Expect(k8sClient.Get(ctx, name, latest)).To(Succeed())
+		Expect(latest.Status.NodeName).To(Equal("node-schedule"))
+		Expect(conditionReason(latest, vmv1alpha1.ConditionScheduled)).To(Equal("Bound"))
+		Expect(runtime.created).To(Equal(1))
+	})
+
+	It("does not schedule when resource fit or host ports would conflict", func() {
+		ctx := context.Background()
+		runtime := newRuntimeHTTPServer("node-fit", "uid-fit")
+		defer runtime.Close()
+		Expect(createReadyNode(ctx, "node-fit", "uid-fit")).To(Succeed())
+		Expect(createReadySmolVMNode(ctx, "node-fit", "uid-fit", runtime.host(), runtime.port(), vmv1alpha1.SmolVMNodeAllocatable{CPUs: 4, MemoryMiB: 4096, StorageGiB: 10})).To(Succeed())
+
+		existingName := types.NamespacedName{Name: "bound-port", Namespace: "default"}
+		existing := testSmolVM(existingName, "")
+		existing.Spec.Network.Ports = []vmv1alpha1.SmolVMPort{{HostPort: 8080, GuestPort: 80}}
+		Expect(createSmolVMWithSpecStatus(ctx, existing, "node-fit", "bound-port-machine")).To(Succeed())
+
+		pendingName := types.NamespacedName{Name: "pending-port", Namespace: "default"}
+		pending := testSmolVM(pendingName, "")
+		pending.Spec.NodeSelector = map[string]string{"kubernetes.io/hostname": "node-fit"}
+		pending.Spec.Network.Ports = []vmv1alpha1.SmolVMPort{{HostPort: 8080, GuestPort: 8080}}
+		Expect(k8sClient.Create(ctx, pending)).To(Succeed())
+		_, err := clusterReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: pendingName})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = clusterReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: pendingName})
+		Expect(err).NotTo(HaveOccurred())
+
+		latest := &vmv1alpha1.SmolVM{}
+		Expect(k8sClient.Get(ctx, pendingName, latest)).To(Succeed())
+		Expect(latest.Status.NodeName).To(BeEmpty())
+		Expect(conditionReason(latest, vmv1alpha1.ConditionScheduled)).To(Equal("NoEligibleNodes"))
+		Expect(conditionMessage(latest, vmv1alpha1.ConditionScheduled)).To(ContainSubstring("hostPort 8080 conflicts"))
+	})
+
+	It("rejects stale or mismatched runtime endpoints before lifecycle operations", func() {
+		ctx := context.Background()
+		runtime := newRuntimeHTTPServer("wrong-node", "uid-mismatch")
+		defer runtime.Close()
+		Expect(createReadyNode(ctx, "node-mismatch", "uid-mismatch")).To(Succeed())
+		Expect(createReadySmolVMNode(ctx, "node-mismatch", "uid-mismatch", runtime.host(), runtime.port(), vmv1alpha1.SmolVMNodeAllocatable{CPUs: 4, MemoryMiB: 4096, StorageGiB: 100})).To(Succeed())
+
+		name := types.NamespacedName{Name: "runtime-identity-mismatch", Namespace: "default"}
+		Expect(createSmolVMWithStatus(ctx, name, "node-mismatch", "runtime-identity-mismatch-machine")).To(Succeed())
+		_, err := clusterReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: name})
+		Expect(err).NotTo(HaveOccurred())
+
+		latest := &vmv1alpha1.SmolVM{}
+		Expect(k8sClient.Get(ctx, name, latest)).To(Succeed())
+		Expect(conditionReason(latest, vmv1alpha1.ConditionReconciled)).To(Equal("RuntimeUnavailable"))
+		Expect(runtime.created).To(Equal(0))
+	})
+
+	It("blocks deletion when the owning runtime is unavailable unless force-delete is explicit", func() {
+		ctx := context.Background()
+		blockedName := types.NamespacedName{Name: "delete-blocked-unavailable", Namespace: "default"}
+		Expect(createSmolVMWithStatus(ctx, blockedName, "node-gone", "delete-blocked-machine")).To(Succeed())
+		Expect(k8sClient.Delete(ctx, &vmv1alpha1.SmolVM{ObjectMeta: metav1.ObjectMeta{Name: blockedName.Name, Namespace: blockedName.Namespace}})).To(Succeed())
+		_, err := clusterReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: blockedName})
+		Expect(err).NotTo(HaveOccurred())
+		blocked := &vmv1alpha1.SmolVM{}
+		Expect(k8sClient.Get(ctx, blockedName, blocked)).To(Succeed())
+		Expect(controllerutil.ContainsFinalizer(blocked, vmv1alpha1.SmolVMFinalizer)).To(BeTrue())
+		Expect(conditionReason(blocked, vmv1alpha1.ConditionDeletionBlocked)).To(Equal("RuntimeUnavailable"))
+
+		forceName := types.NamespacedName{Name: "delete-force-unavailable", Namespace: "default"}
+		force := testSmolVM(forceName, "")
+		force.Annotations = map[string]string{vmv1alpha1.ForceDeleteLocalStateAnnotation: "true"}
+		Expect(createSmolVMWithSpecStatus(ctx, force, "node-gone", "delete-force-machine")).To(Succeed())
+		Expect(k8sClient.Delete(ctx, &vmv1alpha1.SmolVM{ObjectMeta: metav1.ObjectMeta{Name: forceName.Name, Namespace: forceName.Namespace}})).To(Succeed())
+		_, err = clusterReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: forceName})
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(func() bool {
+			err := k8sClient.Get(ctx, forceName, &vmv1alpha1.SmolVM{})
+			return apierrors.IsNotFound(err)
+		}).Should(BeTrue())
+	})
+
 	It("creates a missing runtime machine and records status", func() {
 		ctx := context.Background()
 		name := types.NamespacedName{Name: "runtime-create", Namespace: "default"}
-		resource := testSmolVM(name, "")
-		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+		Expect(createSmolVMWithStatus(ctx, name, "node-a", "runtime-create-machine")).To(Succeed())
 
 		runtime := &fakeRuntime{}
 		reconciler := testReconciler(runtime)
 
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
-		Expect(err).NotTo(HaveOccurred())
-		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(runtime.created).To(Equal(1))
@@ -301,10 +402,8 @@ var _ = Describe("SmolVM Controller", func() {
 		for _, tc := range cases {
 			name := types.NamespacedName{Name: tc.name, Namespace: "default"}
 			if tc.name == "runtime-create-error" {
-				Expect(k8sClient.Create(ctx, tc.vm)).To(Succeed())
+				Expect(createSmolVMWithSpecStatus(ctx, tc.vm, "node-a", tc.name+"-machine")).To(Succeed())
 				_, err := testReconciler(tc.rt).Reconcile(ctx, reconcile.Request{NamespacedName: name})
-				Expect(err).NotTo(HaveOccurred())
-				_, err = testReconciler(tc.rt).Reconcile(ctx, reconcile.Request{NamespacedName: name})
 				Expect(err).NotTo(HaveOccurred())
 			} else {
 				Expect(createSmolVMWithSpecStatus(ctx, tc.vm, "node-a", tc.name+"-machine")).To(Succeed())
@@ -356,26 +455,16 @@ var _ = Describe("SmolVM Controller", func() {
 		Expect(latest.ResourceVersion).To(Equal(resourceVersion))
 	})
 
-	It("no-ops on other nodes and reports awaiting node assignment", func() {
+	It("reconciles bound VMs centrally regardless of local node environment", func() {
 		ctx := context.Background()
-		mismatchName := types.NamespacedName{Name: "runtime-node-mismatch", Namespace: "default"}
-		Expect(createSmolVMWithStatus(ctx, mismatchName, "node-a", "runtime-node-mismatch-machine")).To(Succeed())
+		name := types.NamespacedName{Name: "runtime-central-bound", Namespace: "default"}
+		Expect(createSmolVMWithStatus(ctx, name, "node-a", "runtime-central-bound-machine")).To(Succeed())
 		withNodeName("node-b", func() {
 			runtime := &fakeRuntime{}
-			_, err := testReconciler(runtime).Reconcile(ctx, reconcile.Request{NamespacedName: mismatchName})
+			_, err := testReconciler(runtime).Reconcile(ctx, reconcile.Request{NamespacedName: name})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(runtime.created + runtime.started + runtime.deleted).To(Equal(0))
+			Expect(runtime.created).To(Equal(1))
 		})
-
-		pendingName := types.NamespacedName{Name: "runtime-awaiting-node", Namespace: "default"}
-		Expect(k8sClient.Create(ctx, testSmolVM(pendingName, ""))).To(Succeed())
-		withNodeName("node-a", func() {
-			_, err := testReconciler(&fakeRuntime{}).Reconcile(ctx, reconcile.Request{NamespacedName: pendingName})
-			Expect(err).NotTo(HaveOccurred())
-		})
-		latest := &vmv1alpha1.SmolVM{}
-		Expect(k8sClient.Get(ctx, pendingName, latest)).To(Succeed())
-		Expect(conditionReason(latest, vmv1alpha1.ConditionReconciled)).To(Equal("AwaitingNodeAssignment"))
 	})
 
 	It("rejects invalid specs through CRD admission", func() {
@@ -396,12 +485,10 @@ var _ = Describe("SmolVM Controller", func() {
 	It("emits Kubernetes events for lifecycle and failure transitions", func() {
 		ctx := context.Background()
 		createName := types.NamespacedName{Name: "event-create", Namespace: "default"}
-		Expect(k8sClient.Create(ctx, testSmolVM(createName, "node-a"))).To(Succeed())
+		Expect(createSmolVMWithStatus(ctx, createName, "node-a", "event-create-machine")).To(Succeed())
 		createRecorder := record.NewFakeRecorder(4)
 		createRuntime := &fakeRuntime{}
 		_, err := testReconcilerWithRecorder(createRuntime, createRecorder).Reconcile(ctx, reconcile.Request{NamespacedName: createName})
-		Expect(err).NotTo(HaveOccurred())
-		_, err = testReconcilerWithRecorder(createRuntime, createRecorder).Reconcile(ctx, reconcile.Request{NamespacedName: createName})
 		Expect(err).NotTo(HaveOccurred())
 		Eventually(createRecorder.Events).Should(Receive(ContainSubstring("Creating")))
 
@@ -461,6 +548,12 @@ func testReconcilerWithRecorder(runtime *fakeRuntime, recorder record.EventRecor
 	}
 }
 
+func clusterReconciler() *SmolVMReconciler {
+	Expect(os.Setenv("SMOLVM_RUNTIME_TOKEN", "test-token")).To(Succeed())
+	Expect(os.Setenv("SMOLVM_RUNTIME_INSECURE_SKIP_VERIFY", "true")).To(Succeed())
+	return &SmolVMReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+}
+
 func createSmolVMWithStatus(ctx context.Context, name types.NamespacedName, nodeName, machineName string) error {
 	return createSmolVMWithSpecStatus(ctx, testSmolVM(name, nodeName), nodeName, machineName)
 }
@@ -502,6 +595,130 @@ func conditionReason(vm *vmv1alpha1.SmolVM, conditionType string) string {
 	return ""
 }
 
+func conditionMessage(vm *vmv1alpha1.SmolVM, conditionType string) string {
+	for _, condition := range vm.Status.Conditions {
+		if condition.Type == conditionType {
+			return condition.Message
+		}
+	}
+	return ""
+}
+
+func createReadyNode(ctx context.Context, name, uid string) error {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(uid), Labels: map[string]string{"kubernetes.io/arch": "amd64"}}}
+	if err := k8sClient.Create(ctx, node); err != nil && !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	latest := &corev1.Node{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: name}, latest); err != nil {
+		return err
+	}
+	latest.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
+	latest.Status.Allocatable = corev1.ResourceList{}
+	return k8sClient.Status().Update(ctx, latest)
+}
+
+func createReadySmolVMNode(ctx context.Context, name, uid, host string, port int32, allocatable vmv1alpha1.SmolVMNodeAllocatable) error {
+	node := &vmv1alpha1.SmolVMNode{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{"kubernetes.io/arch": "amd64", "kubernetes.io/hostname": name}}}
+	if err := k8sClient.Create(ctx, node); err != nil && !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	latest := &vmv1alpha1.SmolVMNode{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: name}, latest); err != nil {
+		return err
+	}
+	now := metav1.NewTime(time.Now())
+	latest.Status = vmv1alpha1.SmolVMNodeStatus{
+		NodeUID:         uid,
+		RuntimeVersion:  "test",
+		ProtocolVersion: "v1alpha1",
+		HeartbeatTime:   &now,
+		Endpoint:        vmv1alpha1.SmolVMNodeEndpoint{PodIP: host, Port: port},
+		Allocatable:     allocatable,
+		Conditions: []metav1.Condition{
+			{Type: vmv1alpha1.SmolVMNodeConditionReady, Status: metav1.ConditionTrue, Reason: "Test", Message: "ready", LastTransitionTime: now},
+			{Type: vmv1alpha1.SmolVMNodeConditionKVMAvailable, Status: metav1.ConditionTrue, Reason: "Test", Message: "kvm", LastTransitionTime: now},
+			{Type: vmv1alpha1.SmolVMNodeConditionRuntimeReady, Status: metav1.ConditionTrue, Reason: "Test", Message: "runtime", LastTransitionTime: now},
+			{Type: vmv1alpha1.SmolVMNodeConditionSchedulable, Status: metav1.ConditionTrue, Reason: "Test", Message: "schedulable", LastTransitionTime: now},
+		},
+	}
+	return k8sClient.Status().Update(ctx, latest)
+}
+
+type runtimeHTTPServer struct {
+	*httptest.Server
+	nodeName string
+	nodeUID  string
+	created  int
+}
+
+func newRuntimeHTTPServer(nodeName, nodeUID string) *runtimeHTTPServer {
+	runtime := &runtimeHTTPServer{nodeName: nodeName, nodeUID: nodeUID}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(smolvmapi.Health{OK: true, KVMAvailable: true, SocketReady: true, StateReady: true})
+	})
+	mux.HandleFunc("/api/v1/identity", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(smolvmapi.Identity{NodeName: runtime.nodeName, NodeUID: runtime.nodeUID})
+	})
+	mux.HandleFunc("/api/v1/capabilities", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(smolvmapi.Capabilities{ProtocolVersion: "v1alpha1", KVMAvailable: true})
+	})
+	mux.HandleFunc("/api/v1/machines", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		runtime.created++
+		var req smolvmapi.CreateMachineRequest
+		Expect(json.NewDecoder(r.Body).Decode(&req)).To(Succeed())
+		_ = json.NewEncoder(w).Encode(smolvmapi.MachineInfo{Name: req.Name, State: "stopped", CPUs: req.CPUs, MemoryMiB: req.MemoryMiB})
+	})
+	mux.HandleFunc("/api/v1/machines/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		http.NotFound(w, r)
+	})
+	runtime.Server = httptest.NewTLSServer(mux)
+	return runtime
+}
+
+func (s *runtimeHTTPServer) host() string {
+	parsed, err := url.Parse(s.URL)
+	Expect(err).NotTo(HaveOccurred())
+	host, _, err := net.SplitHostPort(parsed.Host)
+	Expect(err).NotTo(HaveOccurred())
+	return host
+}
+
+func (s *runtimeHTTPServer) port() int32 {
+	parsed, err := url.Parse(s.URL)
+	Expect(err).NotTo(HaveOccurred())
+	_, portString, err := net.SplitHostPort(parsed.Host)
+	Expect(err).NotTo(HaveOccurred())
+	port, err := strconv.Atoi(portString)
+	Expect(err).NotTo(HaveOccurred())
+	return int32(port)
+}
+
 type fakeRuntime struct {
 	machine   *smolvmapi.MachineInfo
 	getErr    error
@@ -515,6 +732,25 @@ type fakeRuntime struct {
 	stopped   int
 	deleted   int
 	resized   int
+}
+
+func (f *fakeRuntime) Health(context.Context) (*smolvmapi.Health, error) {
+	return &smolvmapi.Health{OK: true, KVMAvailable: true, SocketReady: true, StateReady: true}, nil
+}
+
+func (f *fakeRuntime) GetIdentity(context.Context) (*smolvmapi.Identity, error) {
+	return &smolvmapi.Identity{NodeName: "node-a", NodeUID: "uid-a"}, nil
+}
+
+func (f *fakeRuntime) Capabilities(context.Context) (*smolvmapi.Capabilities, error) {
+	return &smolvmapi.Capabilities{ProtocolVersion: "v1alpha1", KVMAvailable: true}, nil
+}
+
+func (f *fakeRuntime) ListMachines(context.Context) ([]smolvmapi.MachineInfo, error) {
+	if f.machine == nil {
+		return nil, nil
+	}
+	return []smolvmapi.MachineInfo{*f.machine}, nil
 }
 
 func (f *fakeRuntime) GetMachine(context.Context, string) (*smolvmapi.MachineInfo, error) {

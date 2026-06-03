@@ -9,8 +9,6 @@ metadata:
     app.kubernetes.io/created-by: operator
   name: smolvm-sample
 spec:
-  # Required when the controller runs node-local with SMOLVM_NODE_NAME set.
-  nodeName: worker-1
   running: true
   image: alpine:latest
   resources:

@@ -3,6 +3,7 @@
 # It should be run by config/default
 resources:
 - bases/vm.smolvm.dev_smolvms.yaml
+- bases/vm.smolvm.dev_smolvmnodes.yaml
 #+kubebuilder:scaffold:crdkustomizeresource
 
 patches:

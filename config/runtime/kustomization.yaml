@@ -1,0 +1,8 @@
+resources:
+- daemonset.yaml
+- networkpolicy.yaml
+
+images:
+- name: smolvm-runtime
+  newName: smolvm-runtime
+  newTag: latest

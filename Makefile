@@ -1,6 +1,8 @@
 
 # Image URL to use all building/pushing image targets
 IMG ?= controller:latest
+RUNTIME_IMG ?= smolvm-runtime:latest
+SMOLVM_VERSION ?= 0.8.1
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION = 1.29.0
 
@@ -64,10 +66,20 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
+.PHONY: test-report
+test-report: manifests generate fmt vet envtest gotestsum ## Run tests and write JUnit/coverage reports under reports/.
+	mkdir -p reports
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" $(GOTESTSUM) --format testname --junitfile reports/unit.xml -- -coverprofile reports/cover.out $$(go list ./... | grep -v /e2e)
+
 # Utilize Kind or modify the e2e tests to load the image locally, enabling compatibility with other vendors.
 .PHONY: test-e2e  # Run the e2e tests against a Kind k8s instance that is spun up.
 test-e2e:
 	go test ./test/e2e/ -v -ginkgo.v
+
+.PHONY: test-e2e-report
+test-e2e-report: gotestsum ## Run e2e tests and write a JUnit report under reports/.
+	mkdir -p reports
+	$(GOTESTSUM) --format testname --junitfile reports/e2e.xml -- ./test/e2e/ -v -ginkgo.v
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter & yamllint
@@ -82,6 +94,7 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
 	go build -o bin/manager cmd/main.go
+	go build -o bin/runtime-agent cmd/runtime-agent/main.go
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
@@ -91,12 +104,17 @@ run: manifests generate fmt vet ## Run a controller from your host.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
-docker-build: ## Build docker image with the manager.
+docker-build: ## Build docker image with the manager and runtime-agent.
 	$(CONTAINER_TOOL) build -t ${IMG} .
 
+.PHONY: docker-build-runtime
+docker-build-runtime: ## Build the smolvm runtime image, including the released smolvm binary.
+	$(CONTAINER_TOOL) build -f Dockerfile.runtime --build-arg SMOLVM_VERSION=$(SMOLVM_VERSION) -t ${RUNTIME_IMG} .
+
 .PHONY: docker-push
-docker-push: ## Push docker image with the manager.
+docker-push: ## Push docker images.
 	$(CONTAINER_TOOL) push ${IMG}
+	$(CONTAINER_TOOL) push ${RUNTIME_IMG}
 
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
@@ -123,6 +141,7 @@ build-installer: manifests generate kustomize ## Generate a consolidated YAML wi
 	fi
 	echo "---" >> dist/install.yaml  # Add a document separator before appending
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
+	cd config/runtime && $(KUSTOMIZE) edit set image smolvm-runtime=${RUNTIME_IMG}
 	$(KUSTOMIZE) build config/default >> dist/install.yaml
 
 ##@ Deployment
@@ -142,6 +161,7 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
+	cd config/runtime && $(KUSTOMIZE) edit set image smolvm-runtime=${RUNTIME_IMG}
 	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
 
 .PHONY: undeploy
@@ -161,12 +181,14 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize-$(KUSTOMIZE_VERSION)
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen-$(CONTROLLER_TOOLS_VERSION)
 ENVTEST ?= $(LOCALBIN)/setup-envtest-$(ENVTEST_VERSION)
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
+GOTESTSUM ?= $(LOCALBIN)/gotestsum-$(GOTESTSUM_VERSION)
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.3.0
 CONTROLLER_TOOLS_VERSION ?= v0.19.0
 ENVTEST_VERSION ?= latest
 GOLANGCI_LINT_VERSION ?= v1.54.2
+GOTESTSUM_VERSION ?= v1.13.0
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
@@ -187,6 +209,11 @@ $(ENVTEST): $(LOCALBIN)
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/cmd/golangci-lint,${GOLANGCI_LINT_VERSION})
+
+.PHONY: gotestsum
+gotestsum: $(GOTESTSUM) ## Download gotestsum locally if necessary.
+$(GOTESTSUM): $(LOCALBIN)
+	$(call go-install-tool,$(GOTESTSUM),gotest.tools/gotestsum,${GOTESTSUM_VERSION})
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary (ideally with version)

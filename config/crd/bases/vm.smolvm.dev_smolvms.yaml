@@ -108,6 +108,12 @@ spec:
                   NodeName pins the machine to a Kubernetes node. Machines are node-local and
                   must not move implicitly after creation.
                 type: string
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: NodeSelector constrains automatic scheduling to nodes
+                  with matching labels.
+                type: object
               resources:
                 description: Resources configures VM CPU and memory.
                 properties:
